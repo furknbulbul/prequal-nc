@@ -38,7 +38,7 @@ func NewMetrics() *Metrics {
 		serverRIF: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "server_rif",
-				Help: "Requests in flight per server",
+				Help: "Server-reported requests in flight (from probe response header)",
 			},
 			[]string{"server_id", "algorithm"},
 		),

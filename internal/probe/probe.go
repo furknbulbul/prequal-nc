@@ -42,8 +42,7 @@ func (p *Prober) ProbeServer(ctx context.Context, server *loadbalancer.Server) *
 		IsHealthy: false,
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET",
-		"http://"+server.Address+"/health", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://"+server.Address+"/health", nil)
 	if err != nil {
 		p.logger.Error("failed to create probe request",
 			slog.String("server", server.ID),

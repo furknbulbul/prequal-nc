@@ -9,8 +9,11 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 )
+
+var inflight int32
 
 func main() {
 	port := os.Getenv("PORT")
@@ -31,6 +34,9 @@ func main() {
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&inflight, 1)
+		defer atomic.AddInt32(&inflight, -1)
+
 		start := time.Now()
 
 		work := 1000 + rand.Intn(500)
@@ -71,6 +77,7 @@ func main() {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Requests-In-Flight", strconv.FormatInt(int64(atomic.LoadInt32(&inflight)), 10))
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `{"status":"healthy","server_id":"%s"}`, serverID)
 	})

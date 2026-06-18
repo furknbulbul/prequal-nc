@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,11 +77,15 @@ func (lb *LoadBalancer) probeAllServers() {
 			lb.probePool[srv.ID] = result
 			srv.IsHealthy = result.IsHealthy
 			srv.Latency = result.Latency
+			if result.IsHealthy {
+				atomic.StoreInt32(&srv.RIF, result.RIF)
+			}
 			lb.mutex.Unlock()
 
 			algorithm := string(lb.config.Algorithm)
 			if result.IsHealthy {
 				lb.metrics.serverHealth.WithLabelValues(srv.ID, algorithm).Set(1)
+				lb.metrics.serverRIF.WithLabelValues(srv.ID, algorithm).Set(float64(result.RIF))
 			} else {
 				lb.metrics.serverHealth.WithLabelValues(srv.ID, algorithm).Set(0)
 			}
@@ -119,9 +124,16 @@ func (lb *LoadBalancer) probeServer(server *Server) *ProbeResult {
 
 	duration := time.Since(start)
 
+	var rif int32
+	if rifStr := resp.Header.Get("X-Requests-In-Flight"); rifStr != "" {
+		if v, err := strconv.ParseInt(rifStr, 10, 32); err == nil {
+			rif = int32(v)
+		}
+	}
+
 	return &ProbeResult{
 		Timestamp: time.Now(),
-		RIF:       atomic.LoadInt32(&server.RIF),
+		RIF:       rif,
 		Latency:   duration.Milliseconds(),
 		IsHealthy: resp.StatusCode == http.StatusOK,
 	}
@@ -298,15 +310,10 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (lb *LoadBalancer) forwardRequest(server *Server, w http.ResponseWriter, r *http.Request) {
 	algorithm := string(lb.config.Algorithm)
-	atomic.AddInt32(&server.RIF, 1)
 	lb.metrics.activeRequests.WithLabelValues(algorithm).Inc()
 
 	defer func() {
-		atomic.AddInt32(&server.RIF, -1)
 		lb.metrics.activeRequests.WithLabelValues(algorithm).Dec()
-
-		currentRIF := atomic.LoadInt32(&server.RIF)
-		lb.metrics.serverRIF.WithLabelValues(server.ID, algorithm).Set(float64(currentRIF))
 	}()
 
 	targetURL, _ := url.Parse("http://" + server.Address)
