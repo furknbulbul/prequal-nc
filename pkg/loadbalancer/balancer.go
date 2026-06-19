@@ -17,14 +17,15 @@ import (
 const probePoolCap = 16
 
 type LoadBalancer struct {
-	servers   []*Server
-	probePool []*ProbePoolEntry
-	config    *Config
-	stats     *Stats
-	logger    *slog.Logger
-	metrics   *Metrics
-	mutex     sync.RWMutex
-	rrIndex   uint32
+	servers        []*Server
+	probePool      []*ProbePoolEntry
+	config         *Config
+	stats          *Stats
+	logger         *slog.Logger
+	metrics        *Metrics
+	mutex          sync.RWMutex
+	rrIndex        uint32
+	lastProbeNanos int64
 }
 
 func NewLoadBalancer(config *Config, logger *slog.Logger) *LoadBalancer {
@@ -44,6 +45,12 @@ func NewLoadBalancer(config *Config, logger *slog.Logger) *LoadBalancer {
 	if config.QRIF == 0 {
 		config.QRIF = 0.84
 	}
+	if config.RProbe == 0 {
+		config.RProbe = 3
+	}
+	if config.MinProbeRate == 0 {
+		config.MinProbeRate = 1
+	}
 
 	return &LoadBalancer{
 		servers:   make([]*Server, 0),
@@ -55,65 +62,83 @@ func NewLoadBalancer(config *Config, logger *slog.Logger) *LoadBalancer {
 	}
 }
 
-func (lb *LoadBalancer) StartProbing() {
-	go func() {
-		ticker := time.NewTicker(lb.config.ProbeInterval)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			lb.probeOnce()
-		}
-	}()
+// onQueryArrival emits floor(RProbe) probes per query, plus one extra
+// with probability frac(RProbe) — stochastic rounding via a Bernoulli
+// trial. RProbe may be fractional and may be < 1. Expected probes per
+// query equals RProbe exactly; per-query count is integer.
+//
+//	r=0.3 → 0 probes 70% of the time, 1 probe 30% of the time
+//	r=1.0 → 1 probe always
+//	r=2.7 → 2 probes 30% of the time, 3 probes 70% of the time
+//	r=3.0 → 3 probes always
+func (lb *LoadBalancer) onQueryArrival() {
+	r := lb.config.RProbe
+	if r <= 0 {
+		return
+	}
+	count := int(r)
+	if frac := r - float64(count); frac > 0 && rand.Float64() < frac {
+		count++
+	}
+	if count == 0 {
+		return
+	}
+	lb.triggerProbes(count)
 }
 
-// probeOnce picks min(probePoolCap, len(servers)) servers uniformly at
-// random without replacement and probes them concurrently. Each healthy
-// probe response is appended to the bounded probe pool, evicting the
-// oldest entry if the pool would exceed probePoolCap.
-func (lb *LoadBalancer) probeOnce() {
+// triggerProbes samples `count` distinct servers uniformly at random
+// without replacement from the available replicas and probes them
+// concurrently. Updates lastProbeNanos so the MinProbeRate enforcer
+// can detect that the query-driven rate is meeting the floor.
+func (lb *LoadBalancer) triggerProbes(count int) {
 	lb.mutex.RLock()
 	n := len(lb.servers)
 	if n == 0 {
 		lb.mutex.RUnlock()
 		return
 	}
-	k := probePoolCap
-	if n < k {
-		k = n
+	if count > n {
+		count = n
 	}
-	perm := rand.Perm(n)[:k]
-	targets := make([]*Server, k)
+	perm := rand.Perm(n)[:count]
+	targets := make([]*Server, count)
 	for i, idx := range perm {
 		targets[i] = lb.servers[idx]
 	}
 	lb.mutex.RUnlock()
 
+	atomic.StoreInt64(&lb.lastProbeNanos, time.Now().UnixNano())
+
 	for _, server := range targets {
 		go func(srv *Server) {
 			result := lb.probeServer(srv)
-			algorithm := string(lb.config.Algorithm)
-
-			lb.mutex.Lock()
-			srv.IsHealthy = result.IsHealthy
-			if result.IsHealthy {
-				srv.Latency = result.Latency
-				atomic.StoreInt32(&srv.RIF, result.RIF)
-				lb.appendPoolEntry(&ProbePoolEntry{
-					Server:     srv,
-					ReceivedAt: result.Timestamp,
-					RIF:        result.RIF,
-					Latency:    result.Latency,
-				})
-			}
-			lb.mutex.Unlock()
-
-			if result.IsHealthy {
-				lb.metrics.serverHealth.WithLabelValues(srv.ID, algorithm).Set(1)
-				lb.metrics.serverRIF.WithLabelValues(srv.ID, algorithm).Set(float64(result.RIF))
-			} else {
-				lb.metrics.serverHealth.WithLabelValues(srv.ID, algorithm).Set(0)
-			}
+			lb.handleProbeResult(srv, result)
 		}(server)
+	}
+}
+
+func (lb *LoadBalancer) handleProbeResult(srv *Server, result *ProbeResult) {
+	algorithm := string(lb.config.Algorithm)
+
+	lb.mutex.Lock()
+	srv.IsHealthy = result.IsHealthy
+	if result.IsHealthy {
+		srv.Latency = result.Latency
+		atomic.StoreInt32(&srv.RIF, result.RIF)
+		lb.appendPoolEntry(&ProbePoolEntry{
+			Server:     srv,
+			ReceivedAt: result.Timestamp,
+			RIF:        result.RIF,
+			Latency:    result.Latency,
+		})
+	}
+	lb.mutex.Unlock()
+
+	if result.IsHealthy {
+		lb.metrics.serverHealth.WithLabelValues(srv.ID, algorithm).Set(1)
+		lb.metrics.serverRIF.WithLabelValues(srv.ID, algorithm).Set(float64(result.RIF))
+	} else {
+		lb.metrics.serverHealth.WithLabelValues(srv.ID, algorithm).Set(0)
 	}
 }
 
@@ -162,9 +187,6 @@ func (lb *LoadBalancer) probeServer(server *Server) *ProbeResult {
 		}
 	}
 
-	// Use the server's send time when available — it excludes probe RTT.
-	// Falls back to the client's receive time if the header is missing
-	// or malformed.
 	timestamp := time.Now()
 	if s := resp.Header.Get("X-Probe-Response-Time"); s != "" {
 		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
@@ -297,6 +319,8 @@ func randomHealthy(servers []*Server) *Server {
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&lb.stats.TotalRequests, 1)
+
+	lb.onQueryArrival()
 
 	server := lb.SelectServer()
 	if server == nil {

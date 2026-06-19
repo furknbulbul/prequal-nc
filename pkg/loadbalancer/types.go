@@ -42,6 +42,12 @@ type Config struct {
 	SelectionChoices int
 	Algorithm        Algorithm
 	QRIF             float64
+	// RProbe is the average number of probes issued per query
+	// (paper §4). May be fractional and may be < 1.
+	RProbe float64
+	// MinProbeRate is the floor on the probing rate in probes/sec.
+	// Effective rate = max(QPS * RProbe, MinProbeRate).
+	MinProbeRate float64
 }
 
 type Stats struct {

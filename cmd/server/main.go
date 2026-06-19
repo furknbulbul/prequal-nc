@@ -59,8 +59,7 @@ func main() {
 		})
 	}
 
-	lb.StartProbing()
-
+	//lb.StartProbing()
 	mux := http.NewServeMux()
 	mux.Handle("/", lb)
 	mux.Handle("/metrics", promhttp.Handler())
