@@ -14,18 +14,18 @@ import (
 	"time"
 )
 
-const probePoolCap = 16
-
 type LoadBalancer struct {
-	servers        []*Server
-	probePool      []*ProbePoolEntry
-	config         *Config
-	stats          *Stats
-	logger         *slog.Logger
-	metrics        *Metrics
-	mutex          sync.RWMutex
-	rrIndex        uint32
-	lastProbeNanos int64
+	servers         []*Server
+	probePool       []*ProbePoolEntry
+	config          *Config
+	stats           *Stats
+	logger          *slog.Logger
+	metrics         *Metrics
+	mutex           sync.RWMutex
+	rrIndex         uint32
+	lastProbeNanos  int64
+	removeDebt      float64
+	removeAltOldest bool
 }
 
 func NewLoadBalancer(config *Config, logger *slog.Logger) *LoadBalancer {
@@ -50,10 +50,22 @@ func NewLoadBalancer(config *Config, logger *slog.Logger) *LoadBalancer {
 	if config.MinProbeRate == 0 {
 		config.MinProbeRate = 1
 	}
+	if config.PoolCap == 0 {
+		config.PoolCap = 16
+	}
+	if config.PoolTTL == 0 {
+		config.PoolTTL = time.Second
+	}
+	if config.RRemove == 0 {
+		config.RRemove = 1
+	}
+	if config.Delta == 0 {
+		config.Delta = 1
+	}
 
 	return &LoadBalancer{
 		servers:   make([]*Server, 0),
-		probePool: make([]*ProbePoolEntry, 0, probePoolCap),
+		probePool: make([]*ProbePoolEntry, 0, config.PoolCap),
 		config:    config,
 		stats:     &Stats{},
 		logger:    logger,
@@ -125,10 +137,11 @@ func (lb *LoadBalancer) handleProbeResult(srv *Server, result *ProbeResult) {
 		srv.Latency = result.Latency
 		atomic.StoreInt32(&srv.RIF, result.RIF)
 		lb.appendPoolEntry(&ProbePoolEntry{
-			Server:     srv,
-			ReceivedAt: result.Timestamp,
-			RIF:        result.RIF,
-			Latency:    result.Latency,
+			Server:        srv,
+			ReceivedAt:    result.Timestamp,
+			RIF:           result.RIF,
+			Latency:       result.Latency,
+			RemainingUses: lb.computeBReuse(),
 		})
 	}
 	lb.mutex.Unlock()
@@ -141,13 +154,44 @@ func (lb *LoadBalancer) handleProbeResult(srv *Server, result *ProbeResult) {
 	}
 }
 
-// appendPoolEntry adds entry to the pool, evicting the oldest entry if
-// the pool would exceed probePoolCap. Caller must hold lb.mutex.
+// appendPoolEntry adds entry to the pool, evicting the oldest entry
+// if the pool would exceed PoolCap (paper §4 removal reason #1).
+// Caller must hold lb.mutex.
 func (lb *LoadBalancer) appendPoolEntry(entry *ProbePoolEntry) {
 	lb.probePool = append(lb.probePool, entry)
-	if len(lb.probePool) > probePoolCap {
-		lb.probePool = lb.probePool[len(lb.probePool)-probePoolCap:]
+	if len(lb.probePool) > lb.config.PoolCap {
+		lb.probePool = lb.probePool[len(lb.probePool)-lb.config.PoolCap:]
 	}
+}
+
+// computeBReuse implements paper §4 eq. (1):
+//
+//	b_reuse = max{1, (1+δ) / ((1-m/n)*r_probe − r_remove)}
+//
+// where m=PoolCap, n=len(servers), r_probe=RProbe, r_remove=RRemove.
+// Returned value is stochastically rounded to an integer to preserve
+// the expectation. Caller must hold lb.mutex (reads len(lb.servers)).
+func (lb *LoadBalancer) computeBReuse() int {
+	n := len(lb.servers)
+	if n == 0 {
+		return 1
+	}
+	m := float64(lb.config.PoolCap)
+	denom := (1-m/float64(n))*lb.config.RProbe - lb.config.RRemove
+	bReuse := 1.0
+	if denom > 0 {
+		if v := (1 + lb.config.Delta) / denom; v > 1 {
+			bReuse = v
+		}
+	}
+	floor := int(bReuse)
+	if frac := bReuse - float64(floor); frac > 0 && rand.Float64() < frac {
+		floor++
+	}
+	if floor < 1 {
+		floor = 1
+	}
+	return floor
 }
 
 func (lb *LoadBalancer) probeServer(server *Server) *ProbeResult {
@@ -237,70 +281,175 @@ func (lb *LoadBalancer) selectServerRR() *Server {
 	return healthyServers[int(index-1)%len(healthyServers)]
 }
 
-// selectServerPrequal runs HCL over the whole probe pool: classify each
-// pool entry as hot/cold by comparing its RIF against the Q_RIF quantile
-// of pool RIF values; pick lowest-latency cold, else lowest-RIF hot.
-// If the pool is empty or all its servers are unhealthy, fall back to a
-// uniformly random healthy server (paper §4).
+// selectServerPrequal runs HCL over the (TTL-swept) probe pool and
+// applies the reuse budget. Classifies each healthy entry as hot/cold
+// by comparing RIF against the Q_RIF quantile; picks lowest-latency
+// cold, else lowest-RIF hot. The winner's RemainingUses is decremented
+// and the entry is removed if its reuse budget is exhausted (paper §4
+// removal reason #2). Falls back to a uniformly random healthy server
+// when the pool is empty or has no healthy entries.
 func (lb *LoadBalancer) selectServerPrequal() *Server {
-	lb.mutex.RLock()
-	defer lb.mutex.RUnlock()
+	lb.mutex.Lock()
+	defer lb.mutex.Unlock()
+
+	lb.sweepExpiredLocked()
 
 	if len(lb.probePool) == 0 {
 		return randomHealthy(lb.servers)
 	}
 
-	entries := make([]*ProbePoolEntry, 0, len(lb.probePool))
-	for _, e := range lb.probePool {
+	healthyIdx := make([]int, 0, len(lb.probePool))
+	for i, e := range lb.probePool {
 		if e.Server.IsHealthy {
-			entries = append(entries, e)
+			healthyIdx = append(healthyIdx, i)
 		}
 	}
-
-	if len(entries) == 0 {
+	if len(healthyIdx) == 0 {
 		return randomHealthy(lb.servers)
 	}
 
-	rifs := make([]int32, len(entries))
-	for i, e := range entries {
+	rifs := make([]int32, len(healthyIdx))
+	for i, idx := range healthyIdx {
+		rifs[i] = lb.probePool[idx].RIF
+	}
+	sort.Slice(rifs, func(i, j int) bool { return rifs[i] < rifs[j] })
+	qIdx := int(float64(len(rifs)-1) * lb.config.QRIF)
+	if qIdx < 0 {
+		qIdx = 0
+	}
+	if qIdx >= len(rifs) {
+		qIdx = len(rifs) - 1
+	}
+	threshold := rifs[qIdx]
+
+	bestCold, bestHot := -1, -1
+	for _, idx := range healthyIdx {
+		e := lb.probePool[idx]
+		if e.RIF > threshold {
+			if bestHot < 0 || e.RIF < lb.probePool[bestHot].RIF {
+				bestHot = idx
+			}
+		} else {
+			if bestCold < 0 || e.Latency < lb.probePool[bestCold].Latency {
+				bestCold = idx
+			}
+		}
+	}
+
+	winnerIdx := bestCold
+	if winnerIdx < 0 {
+		winnerIdx = bestHot
+	}
+	if winnerIdx < 0 {
+		return randomHealthy(lb.servers)
+	}
+
+	winner := lb.probePool[winnerIdx]
+	winner.RemainingUses--
+	if winner.RemainingUses <= 0 {
+		lb.probePool = append(lb.probePool[:winnerIdx], lb.probePool[winnerIdx+1:]...)
+	}
+	return winner.Server
+}
+
+// sweepExpiredLocked drops entries older than PoolTTL (paper §4
+// removal reason #3). Caller must hold lb.mutex.
+func (lb *LoadBalancer) sweepExpiredLocked() {
+	if lb.config.PoolTTL <= 0 || len(lb.probePool) == 0 {
+		return
+	}
+	cutoff := time.Now().Add(-lb.config.PoolTTL)
+	kept := lb.probePool[:0]
+	for _, e := range lb.probePool {
+		if e.ReceivedAt.After(cutoff) {
+			kept = append(kept, e)
+		}
+	}
+	lb.probePool = kept
+}
+
+// applyRRemove deletes floor(removeDebt+RRemove) entries per query,
+// alternating between removing the oldest (worst age) and the worst
+// by reverse-HCL ranking — hot with max RIF if any hot, else cold
+// with max latency (paper §4 removal reason #4, addresses both
+// staleness and degradation).
+func (lb *LoadBalancer) applyRRemove() {
+	if lb.config.RRemove <= 0 {
+		return
+	}
+	lb.mutex.Lock()
+	defer lb.mutex.Unlock()
+
+	lb.removeDebt += lb.config.RRemove
+	n := int(lb.removeDebt)
+	lb.removeDebt -= float64(n)
+	for i := 0; i < n && len(lb.probePool) > 0; i++ {
+		if lb.removeAltOldest {
+			lb.removeOldestLocked()
+		} else {
+			lb.removeWorstLocked()
+		}
+		lb.removeAltOldest = !lb.removeAltOldest
+	}
+}
+
+// removeOldestLocked drops the entry with the minimum ReceivedAt.
+// Caller must hold lb.mutex.
+func (lb *LoadBalancer) removeOldestLocked() {
+	if len(lb.probePool) == 0 {
+		return
+	}
+	oldest := 0
+	for i, e := range lb.probePool {
+		if e.ReceivedAt.Before(lb.probePool[oldest].ReceivedAt) {
+			oldest = i
+		}
+	}
+	lb.probePool = append(lb.probePool[:oldest], lb.probePool[oldest+1:]...)
+}
+
+// removeWorstLocked drops the entry that is "worst" under the reverse
+// HCL ranking: if any pool entry is hot (RIF above the Q_RIF quantile),
+// remove the hot entry with the highest RIF; otherwise remove the cold
+// entry with the highest latency. Caller must hold lb.mutex.
+func (lb *LoadBalancer) removeWorstLocked() {
+	if len(lb.probePool) == 0 {
+		return
+	}
+	rifs := make([]int32, len(lb.probePool))
+	for i, e := range lb.probePool {
 		rifs[i] = e.RIF
 	}
 	sort.Slice(rifs, func(i, j int) bool { return rifs[i] < rifs[j] })
-	idx := int(float64(len(rifs)-1) * lb.config.QRIF)
-	if idx < 0 {
-		idx = 0
+	qIdx := int(float64(len(rifs)-1) * lb.config.QRIF)
+	if qIdx < 0 {
+		qIdx = 0
 	}
-	if idx >= len(rifs) {
-		idx = len(rifs) - 1
+	if qIdx >= len(rifs) {
+		qIdx = len(rifs) - 1
 	}
-	threshold := rifs[idx]
+	threshold := rifs[qIdx]
 
-	var hot, cold []*ProbePoolEntry
-	for _, e := range entries {
+	worstHot, worstCold := -1, -1
+	for i, e := range lb.probePool {
 		if e.RIF > threshold {
-			hot = append(hot, e)
+			if worstHot < 0 || e.RIF > lb.probePool[worstHot].RIF {
+				worstHot = i
+			}
 		} else {
-			cold = append(cold, e)
-		}
-	}
-
-	if len(cold) > 0 {
-		best := cold[0]
-		for _, e := range cold[1:] {
-			if e.Latency < best.Latency {
-				best = e
+			if worstCold < 0 || e.Latency > lb.probePool[worstCold].Latency {
+				worstCold = i
 			}
 		}
-		return best.Server
 	}
-
-	best := hot[0]
-	for _, e := range hot[1:] {
-		if e.RIF < best.RIF {
-			best = e
-		}
+	victim := worstHot
+	if victim < 0 {
+		victim = worstCold
 	}
-	return best.Server
+	if victim < 0 {
+		return
+	}
+	lb.probePool = append(lb.probePool[:victim], lb.probePool[victim+1:]...)
 }
 
 func randomHealthy(servers []*Server) *Server {
@@ -328,6 +477,8 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No available servers", http.StatusServiceUnavailable)
 		return
 	}
+
+	lb.applyRRemove()
 
 	start := time.Now()
 	lb.forwardRequest(server, w, r)
