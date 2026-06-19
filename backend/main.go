@@ -17,7 +17,13 @@ import (
 
 var inflight int32
 
-const latencyRingSize = 128
+const (
+	latencyRingSize = 128
+	// rifWindowDelta defines "at or near the current RIF" for the
+	// stratified latency estimate. We take samples whose arrival-time
+	// RIF is within ±rifWindowDelta of the current RIF.
+	rifWindowDelta = 1
+)
 
 type latencySample struct {
 	latencyMs    int64
@@ -41,20 +47,36 @@ func recordLatency(latencyMs int64, rifAtArrival int32) {
 	}
 }
 
-func medianLatencyMs() int64 {
+// medianLatencyMs returns the median of recorded latencies whose
+// arrival-time RIF is within ±rifWindowDelta of currentRif. If no
+// samples fall in that window, fall back to the median of all samples.
+func medianLatencyMs(currentRif int32) int64 {
 	latencyRingMutex.Lock()
 	n := latencyRingFill
-	samples := make([]int64, n)
+	all := make([]int64, 0, n)
+	near := make([]int64, 0, n)
 	for i := 0; i < n; i++ {
-		samples[i] = latencyRing[i].latencyMs
+		s := latencyRing[i]
+		all = append(all, s.latencyMs)
+		d := s.rifAtArrival - currentRif
+		if d < 0 {
+			d = -d
+		}
+		if d <= rifWindowDelta {
+			near = append(near, s.latencyMs)
+		}
 	}
 	latencyRingMutex.Unlock()
 
-	if n == 0 {
+	samples := near
+	if len(samples) == 0 {
+		samples = all
+	}
+	if len(samples) == 0 {
 		return 0
 	}
 	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-	return samples[n/2]
+	return samples[len(samples)/2]
 }
 
 func main() {
@@ -120,8 +142,10 @@ func main() {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Requests-In-Flight", strconv.FormatInt(int64(atomic.LoadInt32(&inflight)), 10))
-		w.Header().Set("X-Latency-Estimate-Ms", strconv.FormatInt(medianLatencyMs(), 10))
+		currentRif := atomic.LoadInt32(&inflight)
+		w.Header().Set("X-Requests-In-Flight", strconv.FormatInt(int64(currentRif), 10))
+		w.Header().Set("X-Latency-Estimate-Ms", strconv.FormatInt(medianLatencyMs(currentRif), 10))
+		w.Header().Set("X-Probe-Response-Time", strconv.FormatInt(time.Now().UnixNano(), 10))
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `{"status":"healthy","server_id":"%s"}`, serverID)
 	})

@@ -162,8 +162,18 @@ func (lb *LoadBalancer) probeServer(server *Server) *ProbeResult {
 		}
 	}
 
+	// Use the server's send time when available — it excludes probe RTT.
+	// Falls back to the client's receive time if the header is missing
+	// or malformed.
+	timestamp := time.Now()
+	if s := resp.Header.Get("X-Probe-Response-Time"); s != "" {
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			timestamp = time.Unix(0, v)
+		}
+	}
+
 	return &ProbeResult{
-		Timestamp: time.Now(),
+		Timestamp: timestamp,
 		RIF:       rif,
 		Latency:   latency,
 		IsHealthy: resp.StatusCode == http.StatusOK,
