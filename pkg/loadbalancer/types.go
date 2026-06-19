@@ -11,7 +11,6 @@ type Server struct {
 	RIF       int32
 	Latency   int64
 	IsHealthy bool
-	LastProbe time.Time
 }
 
 type ProbeResult struct {
