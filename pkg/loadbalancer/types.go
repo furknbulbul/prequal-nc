@@ -21,6 +21,13 @@ type ProbeResult struct {
 	IsHealthy bool
 }
 
+type ProbePoolEntry struct {
+	Server     *Server
+	ReceivedAt time.Time
+	RIF        int32
+	Latency    int64
+}
+
 type Algorithm string
 
 const (

@@ -7,15 +7,18 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+const probePoolCap = 16
+
 type LoadBalancer struct {
 	servers   []*Server
-	probePool map[string]*ProbeResult
+	probePool []*ProbePoolEntry
 	config    *Config
 	stats     *Stats
 	logger    *slog.Logger
@@ -44,7 +47,7 @@ func NewLoadBalancer(config *Config, logger *slog.Logger) *LoadBalancer {
 
 	return &LoadBalancer{
 		servers:   make([]*Server, 0),
-		probePool: make(map[string]*ProbeResult),
+		probePool: make([]*ProbePoolEntry, 0, probePoolCap),
 		config:    config,
 		stats:     &Stats{},
 		logger:    logger,
@@ -58,31 +61,52 @@ func (lb *LoadBalancer) StartProbing() {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			lb.probeAllServers()
+			lb.probeOnce()
 		}
 	}()
 }
 
-func (lb *LoadBalancer) probeAllServers() {
+// probeOnce picks min(probePoolCap, len(servers)) servers uniformly at
+// random without replacement and probes them concurrently. Each healthy
+// probe response is appended to the bounded probe pool, evicting the
+// oldest entry if the pool would exceed probePoolCap.
+func (lb *LoadBalancer) probeOnce() {
 	lb.mutex.RLock()
-	servers := make([]*Server, len(lb.servers))
-	copy(servers, lb.servers)
+	n := len(lb.servers)
+	if n == 0 {
+		lb.mutex.RUnlock()
+		return
+	}
+	k := probePoolCap
+	if n < k {
+		k = n
+	}
+	perm := rand.Perm(n)[:k]
+	targets := make([]*Server, k)
+	for i, idx := range perm {
+		targets[i] = lb.servers[idx]
+	}
 	lb.mutex.RUnlock()
 
-	for _, server := range servers {
+	for _, server := range targets {
 		go func(srv *Server) {
 			result := lb.probeServer(srv)
+			algorithm := string(lb.config.Algorithm)
 
 			lb.mutex.Lock()
-			lb.probePool[srv.ID] = result
 			srv.IsHealthy = result.IsHealthy
-			srv.Latency = result.Latency
 			if result.IsHealthy {
+				srv.Latency = result.Latency
 				atomic.StoreInt32(&srv.RIF, result.RIF)
+				lb.appendPoolEntry(&ProbePoolEntry{
+					Server:     srv,
+					ReceivedAt: result.Timestamp,
+					RIF:        result.RIF,
+					Latency:    result.Latency,
+				})
 			}
 			lb.mutex.Unlock()
 
-			algorithm := string(lb.config.Algorithm)
 			if result.IsHealthy {
 				lb.metrics.serverHealth.WithLabelValues(srv.ID, algorithm).Set(1)
 				lb.metrics.serverRIF.WithLabelValues(srv.ID, algorithm).Set(float64(result.RIF))
@@ -93,21 +117,26 @@ func (lb *LoadBalancer) probeAllServers() {
 	}
 }
 
+// appendPoolEntry adds entry to the pool, evicting the oldest entry if
+// the pool would exceed probePoolCap. Caller must hold lb.mutex.
+func (lb *LoadBalancer) appendPoolEntry(entry *ProbePoolEntry) {
+	lb.probePool = append(lb.probePool, entry)
+	if len(lb.probePool) > probePoolCap {
+		lb.probePool = lb.probePool[len(lb.probePool)-probePoolCap:]
+	}
+}
+
 func (lb *LoadBalancer) probeServer(server *Server) *ProbeResult {
 	ctx, cancel := context.WithTimeout(context.Background(), lb.config.ProbeTimeout)
 	defer cancel()
 
-	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, "GET",
 		"http://"+server.Address+lb.config.HealthCheckPath, nil)
 	if err != nil {
 		lb.logger.Error("Failed to create probe request",
 			slog.String("server", server.ID),
 			slog.String("error", err.Error()))
-		return &ProbeResult{
-			Timestamp: time.Now(),
-			IsHealthy: false,
-		}
+		return &ProbeResult{Timestamp: time.Now(), IsHealthy: false}
 	}
 
 	resp, err := http.DefaultClient.Do(req)
@@ -115,26 +144,28 @@ func (lb *LoadBalancer) probeServer(server *Server) *ProbeResult {
 		lb.logger.Error("Probe request failed",
 			slog.String("server", server.ID),
 			slog.String("error", err.Error()))
-		return &ProbeResult{
-			Timestamp: time.Now(),
-			IsHealthy: false,
-		}
+		return &ProbeResult{Timestamp: time.Now(), IsHealthy: false}
 	}
 	defer resp.Body.Close()
 
-	duration := time.Since(start)
-
 	var rif int32
-	if rifStr := resp.Header.Get("X-Requests-In-Flight"); rifStr != "" {
-		if v, err := strconv.ParseInt(rifStr, 10, 32); err == nil {
+	if s := resp.Header.Get("X-Requests-In-Flight"); s != "" {
+		if v, err := strconv.ParseInt(s, 10, 32); err == nil {
 			rif = int32(v)
+		}
+	}
+
+	var latency int64
+	if s := resp.Header.Get("X-Latency-Estimate-Ms"); s != "" {
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			latency = v
 		}
 	}
 
 	return &ProbeResult{
 		Timestamp: time.Now(),
 		RIF:       rif,
-		Latency:   duration.Milliseconds(),
+		Latency:   latency,
 		IsHealthy: resp.StatusCode == http.StatusOK,
 	}
 }
@@ -175,117 +206,83 @@ func (lb *LoadBalancer) selectServerRR() *Server {
 	return healthyServers[int(index-1)%len(healthyServers)]
 }
 
+// selectServerPrequal runs HCL over the whole probe pool: classify each
+// pool entry as hot/cold by comparing its RIF against the Q_RIF quantile
+// of pool RIF values; pick lowest-latency cold, else lowest-RIF hot.
+// If the pool is empty or all its servers are unhealthy, fall back to a
+// uniformly random healthy server (paper §4).
 func (lb *LoadBalancer) selectServerPrequal() *Server {
 	lb.mutex.RLock()
 	defer lb.mutex.RUnlock()
 
-	if len(lb.servers) == 0 {
-		return nil
+	if len(lb.probePool) == 0 {
+		return randomHealthy(lb.servers)
 	}
 
-	candidates := make([]*Server, 0, lb.config.SelectionChoices)
-	for i := 0; i < lb.config.SelectionChoices; i++ {
-		randomIndex := rand.Intn(len(lb.servers))
-		candidates = append(candidates, lb.servers[randomIndex])
-	}
-
-	return lb.selectBestCandidate(candidates)
-}
-
-func (lb *LoadBalancer) selectBestCandidate(candidates []*Server) *Server {
-	healthyCandidates := make([]*Server, 0, len(candidates))
-	for _, server := range candidates {
-		if server.IsHealthy {
-			healthyCandidates = append(healthyCandidates, server)
+	entries := make([]*ProbePoolEntry, 0, len(lb.probePool))
+	for _, e := range lb.probePool {
+		if e.Server.IsHealthy {
+			entries = append(entries, e)
 		}
 	}
 
-	if len(healthyCandidates) == 0 {
-		return nil
+	if len(entries) == 0 {
+		return randomHealthy(lb.servers)
 	}
 
-	rifThreshold := lb.calculateRIFThreshold(healthyCandidates)
+	rifs := make([]int32, len(entries))
+	for i, e := range entries {
+		rifs[i] = e.RIF
+	}
+	sort.Slice(rifs, func(i, j int) bool { return rifs[i] < rifs[j] })
+	idx := int(float64(len(rifs)-1) * lb.config.QRIF)
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(rifs) {
+		idx = len(rifs) - 1
+	}
+	threshold := rifs[idx]
 
-	var coldServers []*Server
-	var hotServers []*Server
-
-	for _, server := range healthyCandidates {
-		rif := atomic.LoadInt32(&server.RIF)
-		if rif > rifThreshold {
-			hotServers = append(hotServers, server)
+	var hot, cold []*ProbePoolEntry
+	for _, e := range entries {
+		if e.RIF > threshold {
+			hot = append(hot, e)
 		} else {
-			coldServers = append(coldServers, server)
+			cold = append(cold, e)
 		}
 	}
 
-	if len(coldServers) > 0 {
-		return lb.selectLowestLatency(coldServers)
-	}
-
-	return lb.selectLowestRIF(hotServers)
-}
-
-func (lb *LoadBalancer) calculateRIFThreshold(servers []*Server) int32 {
-	if len(servers) == 0 {
-		return 0
-	}
-
-	rifValues := make([]int32, len(servers))
-	for i, server := range servers {
-		rifValues[i] = atomic.LoadInt32(&server.RIF)
-	}
-
-	for i := 0; i < len(rifValues)-1; i++ {
-		for j := i + 1; j < len(rifValues); j++ {
-			if rifValues[i] > rifValues[j] {
-				rifValues[i], rifValues[j] = rifValues[j], rifValues[i]
+	if len(cold) > 0 {
+		best := cold[0]
+		for _, e := range cold[1:] {
+			if e.Latency < best.Latency {
+				best = e
 			}
 		}
+		return best.Server
 	}
 
-	index := int(float64(len(rifValues)-1) * lb.config.QRIF)
-	if index >= len(rifValues) {
-		index = len(rifValues) - 1
-	}
-
-	return rifValues[index]
-}
-
-func (lb *LoadBalancer) selectLowestLatency(servers []*Server) *Server {
-	if len(servers) == 0 {
-		return nil
-	}
-
-	best := servers[0]
-	minLatency := best.Latency
-
-	for _, server := range servers[1:] {
-		if server.Latency < minLatency {
-			minLatency = server.Latency
-			best = server
+	best := hot[0]
+	for _, e := range hot[1:] {
+		if e.RIF < best.RIF {
+			best = e
 		}
 	}
-
-	return best
+	return best.Server
 }
 
-func (lb *LoadBalancer) selectLowestRIF(servers []*Server) *Server {
-	if len(servers) == 0 {
-		return nil
-	}
-
-	best := servers[0]
-	minRIF := atomic.LoadInt32(&best.RIF)
-
-	for _, server := range servers[1:] {
-		rif := atomic.LoadInt32(&server.RIF)
-		if rif < minRIF {
-			minRIF = rif
-			best = server
+func randomHealthy(servers []*Server) *Server {
+	healthy := make([]*Server, 0, len(servers))
+	for _, s := range servers {
+		if s.IsHealthy {
+			healthy = append(healthy, s)
 		}
 	}
-
-	return best
+	if len(healthy) == 0 {
+		return nil
+	}
+	return healthy[rand.Intn(len(healthy))]
 }
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
