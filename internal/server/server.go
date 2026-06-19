@@ -25,7 +25,6 @@ package server
 //		ProbeInterval:    cfg.ProbeInterval,
 //		ProbeTimeout:     cfg.ProbeTimeout,
 //		HealthCheckPath:  cfg.HealthCheckPath,
-//		SelectionChoices: cfg.SelectionChoices,
 //	}, logger)
 //
 //	for _, serverCfg := range cfg.Servers {

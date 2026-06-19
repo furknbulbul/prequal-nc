@@ -38,7 +38,6 @@ type Config struct {
 	ProbeInterval    time.Duration
 	ProbeTimeout     time.Duration
 	HealthCheckPath  string
-	SelectionChoices int
 	Algorithm        Algorithm
 	QRIF             float64
 	// RProbe is the average number of probes issued per query

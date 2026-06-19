@@ -37,7 +37,6 @@ func main() {
 		ProbeInterval:    time.Second,
 		ProbeTimeout:     time.Second * 2,
 		HealthCheckPath:  "/health",
-		SelectionChoices: 2,
 		Algorithm:        loadbalancer.Algorithm(algo),
 	}
 

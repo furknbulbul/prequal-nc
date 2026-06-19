@@ -14,7 +14,6 @@ type Config struct {
 	ProbeInterval    time.Duration `json:"probe_interval"`
 	ProbeTimeout     time.Duration `json:"probe_timeout"`
 	HealthCheckPath  string        `json:"health_check_path"`
-	SelectionChoices int           `json:"selection_choices"`
 
 	Servers []ServerConfig `json:"servers"`
 
@@ -56,9 +55,6 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if config.HealthCheckPath == "" {
 		config.HealthCheckPath = "/health"
-	}
-	if config.SelectionChoices == 0 {
-		config.SelectionChoices = 2
 	}
 
 	return config, nil

@@ -34,7 +34,6 @@ func NewLoadBalancer(config *Config, logger *slog.Logger) *LoadBalancer {
 			ProbeInterval:    time.Second,
 			ProbeTimeout:     time.Second * 2,
 			HealthCheckPath:  "/health",
-			SelectionChoices: 2,
 			Algorithm:        AlgorithmPrequal,
 			QRIF:             0.84,
 		}

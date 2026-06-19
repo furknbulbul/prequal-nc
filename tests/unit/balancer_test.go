@@ -14,7 +14,6 @@ func TestLoadBalancer(t *testing.T) {
 		ProbeInterval:    time.Second,
 		ProbeTimeout:     time.Second * 2,
 		HealthCheckPath:  "/health",
-		SelectionChoices: 2,
 	}
 
 	lb := loadbalancer.NewLoadBalancer(config, logger)
