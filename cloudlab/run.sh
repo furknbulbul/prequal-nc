@@ -3,6 +3,7 @@
 # Run subcommands from observer-1 (except `bootstrap`, which `deploy` ssh-fans).
 #
 # Usage:
+#   ./run.sh sync <git-url>                         clone/pull repo into /local/repository on every node
 #   ./run.sh deploy                                 install Go + build binaries on all nodes
 #   ./run.sh status                                 show which nodes finished bootstrap
 #   ./run.sh servers                                start backends on srv-*
@@ -83,6 +84,22 @@ cmd_bootstrap() {
 
     touch "$marker"
     echo "bootstrap done"
+}
+
+cmd_sync() {
+    local url=${1:-}
+    [[ -z $url ]] && { echo "usage: $0 sync <git-url>"; exit 1; }
+    echo "syncing $url to ${#ALL_NODES[@]} nodes..."
+    local pids=()
+    for h in "${ALL_NODES[@]}"; do
+        ( SSH "$h" "if [ -d $REPO/.git ]; then \
+              cd $REPO && sudo git fetch --depth=1 origin && sudo git reset --hard origin/HEAD && echo '  [$h] pulled'; \
+          else \
+              sudo rm -rf $REPO && sudo git clone --depth=1 $url $REPO && sudo chown -R \$USER $REPO && echo '  [$h] cloned'; \
+          fi" 2>&1 ) &
+        pids+=($!)
+    done
+    for p in "${pids[@]}"; do wait "$p" || true; done
 }
 
 cmd_deploy() {
@@ -213,6 +230,7 @@ usage() {
 cmd=${1:-}; shift || true
 case "$cmd" in
     bootstrap)  cmd_bootstrap  "$@" ;;
+    sync)       cmd_sync       "$@" ;;
     deploy)     cmd_deploy     "$@" ;;
     status)     cmd_status     "$@" ;;
     servers)    cmd_servers    "$@" ;;
