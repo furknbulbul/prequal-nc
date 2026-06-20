@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'lb-prequal'
+    static_configs:
+      - targets:
+          - lb-prequal-1:8080
+          - lb-prequal-2:8080
+        labels:
+          algorithm: prequal
+    metrics_path: /metrics
+
+  - job_name: 'lb-rr'
+    static_configs:
+      - targets:
+          - lb-rr-1:8080
+          - lb-rr-2:8080
+        labels:
+          algorithm: roundrobin
+    metrics_path: /metrics
