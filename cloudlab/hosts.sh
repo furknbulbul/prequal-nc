@@ -21,6 +21,11 @@ SRV_HOSTS=(
     XXXX.utah.cloudlab.us   # srv-1
     XXXX.utah.cloudlab.us   # srv-2
     XXXX.utah.cloudlab.us   # srv-3
+    XXXX.utah.cloudlab.us   # srv-4
+    XXXX.utah.cloudlab.us   # srv-5
+    XXXX.utah.cloudlab.us   # srv-6
+    XXXX.utah.cloudlab.us   # srv-7
+    XXXX.utah.cloudlab.us   # srv-8
 )
 
 CLIENT_HOSTS=(
@@ -36,4 +41,4 @@ SRV_CPU_LOADS=(60 60 0)
 
 # Backend list LB containers will dial. Use the experiment's short
 # hostnames (CloudLab's /etc/hosts resolves these on every node).
-BACKENDS="srv-1:80,srv-2:80,srv-3:80"
+BACKENDS="srv-1:80,srv-2:80,srv-3:80,srv-4:80,srv-5:80,srv-6:80,srv-7:80,srv-8:80"
