@@ -18,11 +18,8 @@ import (
 var inflight int32
 
 const (
-	latencyRingSize = 128
-	// rifWindowDelta defines "at or near the current RIF" for the
-	// stratified latency estimate. We take samples whose arrival-time
-	// RIF is within ±rifWindowDelta of the current RIF.
-	rifWindowDelta = 1
+	latencyRingSize = 4096
+	rifWindowDelta  = 1
 )
 
 type latencySample struct {
@@ -47,9 +44,6 @@ func recordLatency(latencyMs int64, rifAtArrival int32) {
 	}
 }
 
-// medianLatencyMs returns the median of recorded latencies whose
-// arrival-time RIF is within ±rifWindowDelta of currentRif. If no
-// samples fall in that window, fall back to the median of all samples.
 func medianLatencyMs(currentRif int32) int64 {
 	latencyRingMutex.Lock()
 	n := latencyRingFill
@@ -81,15 +75,8 @@ func medianLatencyMs(currentRif int32) int64 {
 
 func main() {
 	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
 	serverID := os.Getenv("SERVER_ID")
-	if serverID == "" {
-		serverID = "unknown"
-	}
-
+	
 	cpuLoad := 0
 	if loadStr := os.Getenv("CPU_LOAD"); loadStr != "" {
 		if val, err := strconv.Atoi(loadStr); err == nil {

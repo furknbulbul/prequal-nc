@@ -23,65 +23,56 @@ type LoadBalancer struct {
 	metrics         *Metrics
 	mutex           sync.RWMutex
 	rrIndex         uint32
-	lastProbeNanos  int64
 	removeDebt      float64
 	removeAltOldest bool
+	lastProbeNanos  int64
+	stopCh          chan struct{}
 }
 
-func NewLoadBalancer(config *Config, logger *slog.Logger) *LoadBalancer {
-	if config == nil {
-		config = &Config{
-			ProbeInterval:    time.Second,
-			ProbeTimeout:     time.Second * 2,
-			HealthCheckPath:  "/health",
-			Algorithm:        AlgorithmPrequal,
-			QRIF:             0.84,
-		}
-	}
-	if config.Algorithm == "" {
-		config.Algorithm = AlgorithmPrequal
-	}
-	if config.QRIF == 0 {
-		config.QRIF = 0.84
-	}
-	if config.RProbe == 0 {
-		config.RProbe = 3
-	}
-	if config.MinProbeRate == 0 {
-		config.MinProbeRate = 1
-	}
-	if config.PoolCap == 0 {
-		config.PoolCap = 16
-	}
-	if config.PoolTTL == 0 {
-		config.PoolTTL = time.Second
-	}
-	if config.RRemove == 0 {
-		config.RRemove = 1
-	}
-	if config.Delta == 0 {
-		config.Delta = 1
-	}
+const (
+	poolThreshold = 2 // if there is less than or equal to this threshold pool entries, uniformly select from available replicas.
+)
 
-	return &LoadBalancer{
+func NewLoadBalancer(cfg Config, logger *slog.Logger) *LoadBalancer {
+	lb := &LoadBalancer{
 		servers:   make([]*Server, 0),
-		probePool: make([]*ProbePoolEntry, 0, config.PoolCap),
-		config:    config,
+		probePool: make([]*ProbePoolEntry, 0, cfg.PoolCap),
+		config:    &cfg,
 		stats:     &Stats{},
 		logger:    logger,
 		metrics:   NewMetrics(),
+		stopCh:    make(chan struct{}),
+	}
+	if cfg.MinProbeRate > 0 {
+		go lb.idleProbeLoop() // this is a goroutine
+	}
+	return lb
+}
+
+func (lb *LoadBalancer) Stop() {
+	close(lb.stopCh)
+}
+
+func (lb *LoadBalancer) idleProbeLoop() {
+	maxIdle := time.Duration(float64(time.Second) / lb.config.MinProbeRate)
+	if maxIdle <= 0 {
+		return
+	}
+	t := time.NewTicker(maxIdle / 2)
+	defer t.Stop()
+	for {
+		select {
+		case <-lb.stopCh: // if lb.close() is called
+			return
+		case <-t.C:
+			last := atomic.LoadInt64(&lb.lastProbeNanos)
+			if time.Since(time.Unix(0, last)) >= maxIdle {
+				lb.triggerProbes(1)
+			}
+		}
 	}
 }
 
-// onQueryArrival emits floor(RProbe) probes per query, plus one extra
-// with probability frac(RProbe) — stochastic rounding via a Bernoulli
-// trial. RProbe may be fractional and may be < 1. Expected probes per
-// query equals RProbe exactly; per-query count is integer.
-//
-//	r=0.3 → 0 probes 70% of the time, 1 probe 30% of the time
-//	r=1.0 → 1 probe always
-//	r=2.7 → 2 probes 30% of the time, 3 probes 70% of the time
-//	r=3.0 → 3 probes always
 func (lb *LoadBalancer) onQueryArrival() {
 	r := lb.config.RProbe
 	if r <= 0 {
@@ -97,10 +88,6 @@ func (lb *LoadBalancer) onQueryArrival() {
 	lb.triggerProbes(count)
 }
 
-// triggerProbes samples `count` distinct servers uniformly at random
-// without replacement from the available replicas and probes them
-// concurrently. Updates lastProbeNanos so the MinProbeRate enforcer
-// can detect that the query-driven rate is meeting the floor.
 func (lb *LoadBalancer) triggerProbes(count int) {
 	lb.mutex.RLock()
 	n := len(lb.servers)
@@ -154,9 +141,6 @@ func (lb *LoadBalancer) handleProbeResult(srv *Server, result *ProbeResult) {
 	}
 }
 
-// appendPoolEntry adds entry to the pool, evicting the oldest entry
-// if the pool would exceed PoolCap (paper §4 removal reason #1).
-// Caller must hold lb.mutex.
 func (lb *LoadBalancer) appendPoolEntry(entry *ProbePoolEntry) {
 	lb.probePool = append(lb.probePool, entry)
 	if len(lb.probePool) > lb.config.PoolCap {
@@ -164,13 +148,6 @@ func (lb *LoadBalancer) appendPoolEntry(entry *ProbePoolEntry) {
 	}
 }
 
-// computeBReuse implements paper §4 eq. (1):
-//
-//	b_reuse = max{1, (1+δ) / ((1-m/n)*r_probe − r_remove)}
-//
-// where m=PoolCap, n=len(servers), r_probe=RProbe, r_remove=RRemove.
-// Returned value is stochastically rounded to an integer to preserve
-// the expectation. Caller must hold lb.mutex (reads len(lb.servers)).
 func (lb *LoadBalancer) computeBReuse() int {
 	n := len(lb.servers)
 	if n == 0 {
@@ -281,20 +258,13 @@ func (lb *LoadBalancer) selectServerRR() *Server {
 	return healthyServers[int(index-1)%len(healthyServers)]
 }
 
-// selectServerPrequal runs HCL over the (TTL-swept) probe pool and
-// applies the reuse budget. Classifies each healthy entry as hot/cold
-// by comparing RIF against the Q_RIF quantile; picks lowest-latency
-// cold, else lowest-RIF hot. The winner's RemainingUses is decremented
-// and the entry is removed if its reuse budget is exhausted (paper §4
-// removal reason #2). Falls back to a uniformly random healthy server
-// when the pool is empty or has no healthy entries.
 func (lb *LoadBalancer) selectServerPrequal() *Server {
 	lb.mutex.Lock()
 	defer lb.mutex.Unlock()
 
 	lb.sweepExpiredLocked()
 
-	if len(lb.probePool) == 0 {
+	if len(lb.probePool) <= poolThreshold {
 		return randomHealthy(lb.servers)
 	}
 
@@ -352,8 +322,6 @@ func (lb *LoadBalancer) selectServerPrequal() *Server {
 	return winner.Server
 }
 
-// sweepExpiredLocked drops entries older than PoolTTL (paper §4
-// removal reason #3). Caller must hold lb.mutex.
 func (lb *LoadBalancer) sweepExpiredLocked() {
 	if lb.config.PoolTTL <= 0 || len(lb.probePool) == 0 {
 		return
@@ -368,11 +336,6 @@ func (lb *LoadBalancer) sweepExpiredLocked() {
 	lb.probePool = kept
 }
 
-// applyRRemove deletes floor(removeDebt+RRemove) entries per query,
-// alternating between removing the oldest (worst age) and the worst
-// by reverse-HCL ranking — hot with max RIF if any hot, else cold
-// with max latency (paper §4 removal reason #4, addresses both
-// staleness and degradation).
 func (lb *LoadBalancer) applyRRemove() {
 	if lb.config.RRemove <= 0 {
 		return
@@ -393,8 +356,6 @@ func (lb *LoadBalancer) applyRRemove() {
 	}
 }
 
-// removeOldestLocked drops the entry with the minimum ReceivedAt.
-// Caller must hold lb.mutex.
 func (lb *LoadBalancer) removeOldestLocked() {
 	if len(lb.probePool) == 0 {
 		return
@@ -408,10 +369,6 @@ func (lb *LoadBalancer) removeOldestLocked() {
 	lb.probePool = append(lb.probePool[:oldest], lb.probePool[oldest+1:]...)
 }
 
-// removeWorstLocked drops the entry that is "worst" under the reverse
-// HCL ranking: if any pool entry is hot (RIF above the Q_RIF quantile),
-// remove the hot entry with the highest RIF; otherwise remove the cold
-// entry with the highest latency. Caller must hold lb.mutex.
 func (lb *LoadBalancer) removeWorstLocked() {
 	if len(lb.probePool) == 0 {
 		return
