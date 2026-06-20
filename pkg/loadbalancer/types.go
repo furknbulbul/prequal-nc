@@ -64,7 +64,7 @@ func DefaultConfig() Config {
 		QRIF:            0.84,
 		RProbe:          3,
 		MinProbeRate:    10,
-		PoolCap:         16,
+		PoolCap:         4,
 		PoolTTL:         time.Second,
 		RRemove:         1,
 		Delta:           1,
