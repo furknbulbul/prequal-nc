@@ -16,7 +16,7 @@ import (
 
 type LoadBalancer struct {
 	servers         []*Server
-	probePool       []*ProbePoolEntry
+	probePool       map[string]*ProbePoolEntry
 	config          *Config
 	stats           *Stats
 	logger          *slog.Logger
@@ -36,7 +36,7 @@ const (
 func NewLoadBalancer(cfg Config, logger *slog.Logger) *LoadBalancer {
 	lb := &LoadBalancer{
 		servers:   make([]*Server, 0),
-		probePool: make([]*ProbePoolEntry, 0, cfg.PoolCap),
+		probePool: make(map[string]*ProbePoolEntry, cfg.PoolCap),
 		config:    &cfg,
 		stats:     &Stats{},
 		logger:    logger,
@@ -123,7 +123,7 @@ func (lb *LoadBalancer) handleProbeResult(srv *Server, result *ProbeResult) {
 	if result.IsHealthy {
 		srv.Latency = result.Latency
 		atomic.StoreInt32(&srv.RIF, result.RIF)
-		lb.appendPoolEntry(&ProbePoolEntry{
+		lb.updatePoolEntry(&ProbePoolEntry{
 			Server:        srv,
 			ReceivedAt:    result.Timestamp,
 			RIF:           result.RIF,
@@ -141,11 +141,13 @@ func (lb *LoadBalancer) handleProbeResult(srv *Server, result *ProbeResult) {
 	}
 }
 
-func (lb *LoadBalancer) appendPoolEntry(entry *ProbePoolEntry) {
-	lb.probePool = append(lb.probePool, entry)
-	if len(lb.probePool) > lb.config.PoolCap {
-		lb.probePool = lb.probePool[len(lb.probePool)-lb.config.PoolCap:]
+func (lb *LoadBalancer) updatePoolEntry(entry *ProbePoolEntry) {
+	if _, exists := lb.probePool[entry.Server.ID]; !exists {
+		if len(lb.probePool) >= lb.config.PoolCap {
+			lb.removeOldestLocked()
+		}
 	}
+	lb.probePool[entry.Server.ID] = entry
 }
 
 func (lb *LoadBalancer) computeBReuse() int {
@@ -268,19 +270,19 @@ func (lb *LoadBalancer) selectServerPrequal() *Server {
 		return randomHealthy(lb.servers)
 	}
 
-	healthyIdx := make([]int, 0, len(lb.probePool))
-	for i, e := range lb.probePool {
+	healthy := make([]*ProbePoolEntry, 0, len(lb.probePool))
+	for _, e := range lb.probePool {
 		if e.Server.IsHealthy {
-			healthyIdx = append(healthyIdx, i)
+			healthy = append(healthy, e)
 		}
 	}
-	if len(healthyIdx) == 0 {
+	if len(healthy) == 0 {
 		return randomHealthy(lb.servers)
 	}
 
-	rifs := make([]int32, len(healthyIdx))
-	for i, idx := range healthyIdx {
-		rifs[i] = lb.probePool[idx].RIF
+	rifs := make([]int32, len(healthy))
+	for i, e := range healthy {
+		rifs[i] = e.RIF
 	}
 	sort.Slice(rifs, func(i, j int) bool { return rifs[i] < rifs[j] })
 	qIdx := int(float64(len(rifs)-1) * lb.config.QRIF)
@@ -292,32 +294,30 @@ func (lb *LoadBalancer) selectServerPrequal() *Server {
 	}
 	threshold := rifs[qIdx]
 
-	bestCold, bestHot := -1, -1
-	for _, idx := range healthyIdx {
-		e := lb.probePool[idx]
+	var bestHot, bestCold *ProbePoolEntry
+	for _, e := range healthy {
 		if e.RIF > threshold {
-			if bestHot < 0 || e.RIF < lb.probePool[bestHot].RIF {
-				bestHot = idx
+			if bestHot == nil || e.RIF < bestHot.RIF {
+				bestHot = e
 			}
 		} else {
-			if bestCold < 0 || e.Latency < lb.probePool[bestCold].Latency {
-				bestCold = idx
+			if bestCold == nil || e.Latency < bestCold.Latency {
+				bestCold = e
 			}
 		}
 	}
 
-	winnerIdx := bestCold
-	if winnerIdx < 0 {
-		winnerIdx = bestHot
+	winner := bestCold
+	if winner == nil {
+		winner = bestHot
 	}
-	if winnerIdx < 0 {
+	if winner == nil {
 		return randomHealthy(lb.servers)
 	}
 
-	winner := lb.probePool[winnerIdx]
 	winner.RemainingUses--
 	if winner.RemainingUses <= 0 {
-		lb.probePool = append(lb.probePool[:winnerIdx], lb.probePool[winnerIdx+1:]...)
+		delete(lb.probePool, winner.Server.ID)
 	}
 	return winner.Server
 }
@@ -327,13 +327,11 @@ func (lb *LoadBalancer) sweepExpiredLocked() {
 		return
 	}
 	cutoff := time.Now().Add(-lb.config.PoolTTL)
-	kept := lb.probePool[:0]
-	for _, e := range lb.probePool {
-		if e.ReceivedAt.After(cutoff) {
-			kept = append(kept, e)
+	for id, e := range lb.probePool {
+		if !e.ReceivedAt.After(cutoff) {
+			delete(lb.probePool, id)
 		}
 	}
-	lb.probePool = kept
 }
 
 func (lb *LoadBalancer) applyRRemove() {
@@ -360,22 +358,26 @@ func (lb *LoadBalancer) removeOldestLocked() {
 	if len(lb.probePool) == 0 {
 		return
 	}
-	oldest := 0
-	for i, e := range lb.probePool {
-		if e.ReceivedAt.Before(lb.probePool[oldest].ReceivedAt) {
-			oldest = i
+	var oldestID string
+	var oldestTime time.Time
+	first := true
+	for id, e := range lb.probePool {
+		if first || e.ReceivedAt.Before(oldestTime) {
+			oldestID = id
+			oldestTime = e.ReceivedAt
+			first = false
 		}
 	}
-	lb.probePool = append(lb.probePool[:oldest], lb.probePool[oldest+1:]...)
+	delete(lb.probePool, oldestID)
 }
 
 func (lb *LoadBalancer) removeWorstLocked() {
 	if len(lb.probePool) == 0 {
 		return
 	}
-	rifs := make([]int32, len(lb.probePool))
-	for i, e := range lb.probePool {
-		rifs[i] = e.RIF
+	rifs := make([]int32, 0, len(lb.probePool))
+	for _, e := range lb.probePool {
+		rifs = append(rifs, e.RIF)
 	}
 	sort.Slice(rifs, func(i, j int) bool { return rifs[i] < rifs[j] })
 	qIdx := int(float64(len(rifs)-1) * lb.config.QRIF)
@@ -387,26 +389,26 @@ func (lb *LoadBalancer) removeWorstLocked() {
 	}
 	threshold := rifs[qIdx]
 
-	worstHot, worstCold := -1, -1
-	for i, e := range lb.probePool {
+	var worstHot, worstCold *ProbePoolEntry
+	for _, e := range lb.probePool {
 		if e.RIF > threshold {
-			if worstHot < 0 || e.RIF > lb.probePool[worstHot].RIF {
-				worstHot = i
+			if worstHot == nil || e.RIF > worstHot.RIF {
+				worstHot = e
 			}
 		} else {
-			if worstCold < 0 || e.Latency > lb.probePool[worstCold].Latency {
-				worstCold = i
+			if worstCold == nil || e.Latency > worstCold.Latency {
+				worstCold = e
 			}
 		}
 	}
 	victim := worstHot
-	if victim < 0 {
+	if victim == nil {
 		victim = worstCold
 	}
-	if victim < 0 {
+	if victim == nil {
 		return
 	}
-	lb.probePool = append(lb.probePool[:victim], lb.probePool[victim+1:]...)
+	delete(lb.probePool, victim.Server.ID)
 }
 
 func randomHealthy(servers []*Server) *Server {
