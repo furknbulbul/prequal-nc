@@ -1,37 +1,84 @@
 services:
-  loadbalancer-prequal:
+
+  lb-prequal-1:
     build: .
-    container_name: lb-prequal
+    container_name: lb-prequal-1
     ports:
-      - "8080:8080"
+      - "10080:8080"
     networks:
       - loadbalancer-net
     environment:
-      - BACKEND_SERVER1=server1
-      - BACKEND_SERVER2=server2
-      - BACKEND_SERVER3=server3
+      - BACKEND_SERVERS=server1:80,server2:80,server3:80,server4:80,server5:80,server6:80,server7:80,server8:80
       - LB_ALGORITHM=prequal
     depends_on:
       - server1
       - server2
       - server3
+      - server4
+      - server5
+      - server6
+      - server7
+      - server8
 
-  loadbalancer-rr:
+  lb-prequal-2:
     build: .
-    container_name: lb-roundrobin
+    container_name: lb-prequal-2
     ports:
-      - "8081:8080"
+      - "10081:8080"
     networks:
       - loadbalancer-net
     environment:
-      - BACKEND_SERVER1=server1
-      - BACKEND_SERVER2=server2
-      - BACKEND_SERVER3=server3
+      - BACKEND_SERVERS=server1:80,server2:80,server3:80,server4:80,server5:80,server6:80,server7:80,server8:80
+      - LB_ALGORITHM=prequal
+    depends_on:
+      - server1
+      - server2
+      - server3
+      - server4
+      - server5
+      - server6
+      - server7
+      - server8
+
+  lb-rr-1:
+    build: .
+    container_name: lb-rr-1
+    ports:
+      - "20080:8080"
+    networks:
+      - loadbalancer-net
+    environment:
+      - BACKEND_SERVERS=server1:80,server2:80,server3:80,server4:80,server5:80,server6:80,server7:80,server8:80
       - LB_ALGORITHM=roundrobin
     depends_on:
       - server1
       - server2
       - server3
+      - server4
+      - server5
+      - server6
+      - server7
+      - server8
+
+  lb-rr-2:
+    build: .
+    container_name: lb-rr-2
+    ports:
+      - "20081:8080"
+    networks:
+      - loadbalancer-net
+    environment:
+      - BACKEND_SERVERS=server1:80,server2:80,server3:80,server4:80,server5:80,server6:80,server7:80,server8:80
+      - LB_ALGORITHM=roundrobin
+    depends_on:
+      - server1
+      - server2
+      - server3
+      - server4
+      - server5
+      - server6
+      - server7
+      - server8
 
   server1:
     build: ./backend
@@ -64,6 +111,61 @@ services:
       - SERVER_ID=server3
       - PORT=80
       - CPU_LOAD=0
+    cpus: 1.0
+
+  server4:
+    build: ./backend
+    container_name: server4
+    networks:
+      - loadbalancer-net
+    environment:
+      - SERVER_ID=server4
+      - PORT=80
+      - CPU_LOAD=60
+    cpus: 1.0
+
+  server5:
+    build: ./backend
+    container_name: server5
+    networks:
+      - loadbalancer-net
+    environment:
+      - SERVER_ID=server5
+      - PORT=80
+      - CPU_LOAD=60
+    cpus: 1.0
+
+  server6:
+    build: ./backend
+    container_name: server6
+    networks:
+      - loadbalancer-net
+    environment:
+      - SERVER_ID=server6
+      - PORT=80
+      - CPU_LOAD=0
+    cpus: 1.0
+
+  server7:
+    build: ./backend
+    container_name: server7
+    networks:
+      - loadbalancer-net
+    environment:
+      - SERVER_ID=server7
+      - PORT=80
+      - CPU_LOAD=60
+    cpus: 1.0
+
+  server8:
+    build: ./backend
+    container_name: server8
+    networks:
+      - loadbalancer-net
+    environment:
+      - SERVER_ID=server8
+      - PORT=80
+      - CPU_LOAD=60
     cpus: 1.0
 
   prometheus:
