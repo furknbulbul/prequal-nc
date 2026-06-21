@@ -84,14 +84,19 @@ func main() {
 		}
 	}
 
+	workMean := 1000.0
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		rifAtArrival := atomic.AddInt32(&inflight, 1)
 		defer atomic.AddInt32(&inflight, -1)
 
 		start := time.Now()
 
-		work := 1000 + rand.Intn(500)
-		for i := range work {
+		work := int(rand.NormFloat64()*workMean + workMean)
+		if work < 0 {
+			work = 0
+		}
+		for i := 0; i < work; i++ {
 			hash := sha256.Sum256([]byte(fmt.Sprintf("%d-%d", time.Now().UnixNano(), i)))
 			_ = hex.EncodeToString(hash[:])
 		}
