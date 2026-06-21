@@ -1,15 +1,19 @@
 #!/bin/bash
-# CloudLab distributed deployment orchestrator.
+# CloudLab distributed deployment orchestrator for the Prequal Figure 6 testbed.
+#
+# Run from your laptop. Reads cloudlab/hosts.sh for SSH hostnames.
 #
 # Usage:
-#   cp cloudlab/hosts.example cloudlab/hosts.sh    # then edit hostnames
-#   ./cloudlab/deploy.sh bootstrap   # install docker + git on every node
-#   ./cloudlab/deploy.sh sync        # rsync this repo to every node
-#   ./cloudlab/deploy.sh build       # build LB + backend images
-#   ./cloudlab/deploy.sh run         # start the right container per role
-#   ./cloudlab/deploy.sh verify      # health-check every container
-#   ./cloudlab/deploy.sh teardown    # stop + remove all containers
-#   ./cloudlab/deploy.sh all         # bootstrap; sync; build; run; verify
+#   cp cloudlab/hosts.sh.example cloudlab/hosts.sh   # then edit
+#   ./cloudlab/deploy.sh bootstrap     # install docker on every node
+#   ./cloudlab/deploy.sh sync          # rsync this repo to every node
+#   ./cloudlab/deploy.sh build         # build LB + backend docker images
+#   ./cloudlab/deploy.sh run           # start backends, LBs, observer, clients
+#   ./cloudlab/deploy.sh antagonist    # start stress-ng on configured srv nodes
+#   ./cloudlab/deploy.sh stop-antagonist
+#   ./cloudlab/deploy.sh verify        # health-check every component
+#   ./cloudlab/deploy.sh teardown      # stop + remove all containers
+#   ./cloudlab/deploy.sh all           # bootstrap; sync; build; run; verify
 
 set -e
 
@@ -19,11 +23,15 @@ HOSTS_FILE="$SCRIPT_DIR/hosts.sh"
 
 if [ ! -f "$HOSTS_FILE" ]; then
     echo "Error: $HOSTS_FILE not found."
-    echo "Copy hosts.example to hosts.sh and fill in your CloudLab hostnames."
+    echo "Edit hosts.sh and fill in your CloudLab hostnames."
     exit 1
 fi
 # shellcheck disable=SC1090
 source "$HOSTS_FILE"
+
+: "${BACKEND_PORT:=80}"
+: "${LB_PORT:=8080}"
+: "${NODE_EXPORTER_PORT:=9100}"
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new \
           -o UserKnownHostsFile=/dev/null \
@@ -56,14 +64,8 @@ all_hosts() {
         "${OBSERVER_HOSTS[@]}"
 }
 
-# tag prefixes every line of stdin with [host] so interleaved output
-# from parallel ssh fan-outs stays readable.
-tag() {
-    sed -u "s|^|[$1] |"
-}
+tag() { sed -u "s|^|[$1] |"; }
 
-# pwait waits for every pid passed in. Returns non-zero if any failed,
-# but doesn't short-circuit — every background job is joined.
 pwait() {
     local pid status=0
     for pid in "$@"; do
@@ -84,7 +86,8 @@ cmd_bootstrap() {
             ssh_run "$h" "
                 set -e
                 sudo apt-get update -qq
-                sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io git rsync curl
+                sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                    docker.io git rsync curl stress-ng
                 sudo systemctl enable --now docker
             " 2>&1 | tag "$h"
             echo "[$h] bootstrap done"
@@ -111,17 +114,15 @@ cmd_build() {
     local pids=()
     for h in "${SRV_HOSTS[@]}"; do
         (
-            echo "[$h] build backend starting"
+            echo "[$h] build backend"
             ssh_run "$h" "cd loadbalancer && sudo docker build -q -t prequal-backend ./backend" 2>&1 | tag "$h"
-            echo "[$h] build backend done"
         ) &
         pids+=($!)
     done
     for h in "${PREQUAL_HOSTS[@]}" "${RR_HOSTS[@]}"; do
         (
-            echo "[$h] build LB starting"
+            echo "[$h] build LB"
             ssh_run "$h" "cd loadbalancer && sudo docker build -q -t prequal-lb ." 2>&1 | tag "$h"
-            echo "[$h] build LB done"
         ) &
         pids+=($!)
     done
@@ -140,8 +141,29 @@ cmd_run_backends() {
                 sudo docker rm -f backend 2>/dev/null || true
                 sudo docker run -d --restart=unless-stopped --name backend \
                     --network host \
-                    -e SERVER_ID=srv-$idx -e PORT=80 -e CPU_LOAD=$load \
+                    -e SERVER_ID=srv-$idx -e PORT=$BACKEND_PORT -e CPU_LOAD=$load \
                     prequal-backend
+            " 2>&1 | tag "$h"
+        ) &
+        pids+=($!)
+    done
+    pwait "${pids[@]}"
+}
+
+cmd_run_node_exporters() {
+    # node_exporter on every srv-* so the observer can scrape real CPU%
+    local pids=()
+    for h in "${SRV_HOSTS[@]}"; do
+        (
+            echo "[$h] run node_exporter"
+            ssh_run "$h" "
+                sudo docker rm -f node_exporter 2>/dev/null || true
+                sudo docker run -d --restart=unless-stopped --name node_exporter \
+                    --network host --pid host \
+                    -v /:/host:ro,rslave \
+                    prom/node-exporter \
+                    --path.rootfs=/host \
+                    --web.listen-address=:$NODE_EXPORTER_PORT
             " 2>&1 | tag "$h"
         ) &
         pids+=($!)
@@ -180,10 +202,8 @@ cmd_run_lbs() {
     pwait "${pids[@]}"
 }
 
-cmd_run_client() {
-    # Ubuntu's golang-go is too old to parse three-part 'go x.y.z' directives
-    # in modern modules (rakyll/hey now requires Go >= 1.21). Install upstream
-    # Go directly so 'go install github.com/rakyll/hey@latest' works.
+cmd_install_clients() {
+    # Install upstream Go + hey on each client. Ubuntu's golang-go is too old.
     local GO_VER=1.24.0
     local pids=()
     for h in "${CLIENT_HOSTS[@]}"; do
@@ -221,14 +241,29 @@ cmd_run_observer() {
         echo "  scrape_interval: 5s"
         echo "  evaluation_interval: 5s"
         echo "scrape_configs:"
-        echo "  - job_name: loadbalancer"
+        echo "  - job_name: 'lb-prequal'"
+        echo "    metrics_path: /metrics"
         echo "    static_configs:"
         echo "      - targets:"
         for i in $(seq 1 "${#PREQUAL_HOSTS[@]}"); do
-            echo "          - lb-prequal-$i:8080"
+            echo "          - lb-prequal-$i:$LB_PORT"
         done
+        echo "        labels:"
+        echo "          algorithm: prequal"
+        echo "  - job_name: 'lb-rr'"
+        echo "    metrics_path: /metrics"
+        echo "    static_configs:"
+        echo "      - targets:"
         for i in $(seq 1 "${#RR_HOSTS[@]}"); do
-            echo "          - lb-rr-$i:8080"
+            echo "          - lb-rr-$i:$LB_PORT"
+        done
+        echo "        labels:"
+        echo "          algorithm: roundrobin"
+        echo "  - job_name: 'node'"
+        echo "    static_configs:"
+        echo "      - targets:"
+        for i in $(seq 1 "${#SRV_HOSTS[@]}"); do
+            echo "          - srv-$i:$NODE_EXPORTER_PORT"
         done
     } > "$cfg"
 
@@ -236,9 +271,6 @@ cmd_run_observer() {
     for h in "${OBSERVER_HOSTS[@]}"; do
         (
             echo "[$h] push prometheus.yml + start prometheus + grafana"
-            # Stage in /tmp (writable by SSH user) then move to /etc/prometheus
-            # so the container's 'nobody' uid can read it — $HOME is 0750 on
-            # Ubuntu and blocks traversal for uid 65534.
             scp_to "$cfg" "$h" "/tmp/prometheus.yml" 2>&1 | tag "$h"
             ssh_run "$h" "
                 set -e
@@ -266,9 +298,47 @@ cmd_run_observer() {
 
 cmd_run() {
     cmd_run_backends
+    cmd_run_node_exporters
     cmd_run_lbs
-    cmd_run_client
+    cmd_install_clients
     cmd_run_observer
+}
+
+cmd_antagonist() {
+    # Background stress-ng on each srv-* per SRV_ANTAGONIST_CPUS.
+    # Cycles 60s on / 30s off so contention is bursty, like the paper's
+    # "unpredictable time-varying antagonist load".
+    local pids=()
+    for i in "${!SRV_HOSTS[@]}"; do
+        local h=${SRV_HOSTS[$i]}
+        local n=${SRV_ANTAGONIST_CPUS[$i]:-0}
+        if [ "$n" -eq 0 ]; then continue; fi
+        (
+            echo "[$h] antagonist start (cpu=$n)"
+            ssh_run "$h" "
+                sudo docker rm -f antagonist 2>/dev/null || true
+                sudo docker run -d --restart=unless-stopped --name antagonist \
+                    --network host \
+                    --entrypoint /bin/sh \
+                    alpine:3 \
+                    -c 'apk add --no-cache stress-ng >/dev/null && \
+                        while :; do stress-ng --cpu $n --timeout 60s >/dev/null 2>&1; sleep 30; done'
+            " 2>&1 | tag "$h"
+        ) &
+        pids+=($!)
+    done
+    pwait "${pids[@]}"
+}
+
+cmd_stop_antagonist() {
+    local pids=()
+    for h in "${SRV_HOSTS[@]}"; do
+        (
+            ssh_run "$h" "sudo docker rm -f antagonist 2>/dev/null || true" 2>&1 | tag "$h"
+        ) &
+        pids+=($!)
+    done
+    pwait "${pids[@]}"
 }
 
 check_host() {
@@ -284,17 +354,22 @@ cmd_verify() {
     local pids=()
     echo "--- Backends ---"
     for h in "${SRV_HOSTS[@]}"; do
-        check_host "$h" "http://localhost:80/health" backend &
+        check_host "$h" "http://localhost:$BACKEND_PORT/health" backend &
         pids+=($!)
     done
     echo "--- Prequal LBs ---"
     for h in "${PREQUAL_HOSTS[@]}"; do
-        check_host "$h" "http://localhost:8080/" prequal-lb &
+        check_host "$h" "http://localhost:$LB_PORT/" prequal-lb &
         pids+=($!)
     done
     echo "--- RR LBs ---"
     for h in "${RR_HOSTS[@]}"; do
-        check_host "$h" "http://localhost:8080/" rr-lb &
+        check_host "$h" "http://localhost:$LB_PORT/" rr-lb &
+        pids+=($!)
+    done
+    echo "--- node_exporters ---"
+    for h in "${SRV_HOSTS[@]}"; do
+        check_host "$h" "http://localhost:$NODE_EXPORTER_PORT/metrics" node_exporter &
         pids+=($!)
     done
     echo "--- Observer ---"
@@ -320,12 +395,14 @@ cmd_teardown() {
 }
 
 case "${1:-help}" in
-    bootstrap) cmd_bootstrap ;;
-    sync)      cmd_sync ;;
-    build)     cmd_build ;;
-    run)       cmd_run ;;
-    verify)    cmd_verify ;;
-    teardown)  cmd_teardown ;;
+    bootstrap)        cmd_bootstrap ;;
+    sync)             cmd_sync ;;
+    build)            cmd_build ;;
+    run)              cmd_run ;;
+    antagonist)       cmd_antagonist ;;
+    stop-antagonist)  cmd_stop_antagonist ;;
+    verify)           cmd_verify ;;
+    teardown)         cmd_teardown ;;
     all)
         cmd_bootstrap
         cmd_sync
@@ -336,6 +413,6 @@ case "${1:-help}" in
         cmd_verify
         ;;
     help|--help|-h|*)
-        sed -n '2,15p' "$0"
+        sed -n '2,18p' "$0"
         ;;
 esac
