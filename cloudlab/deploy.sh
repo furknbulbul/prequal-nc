@@ -181,16 +181,31 @@ cmd_run_lbs() {
 }
 
 cmd_run_client() {
+    # Ubuntu's golang-go is too old to parse three-part 'go x.y.z' directives
+    # in modern modules (rakyll/hey now requires Go >= 1.21). Install upstream
+    # Go directly so 'go install github.com/rakyll/hey@latest' works.
+    local GO_VER=1.24.0
     local pids=()
     for h in "${CLIENT_HOSTS[@]}"; do
         (
-            echo "[$h] install hey"
+            echo "[$h] install Go ${GO_VER} + hey"
             ssh_run "$h" "
                 set -e
-                sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq golang-go
-                GOBIN=\$HOME/bin go install github.com/rakyll/hey@latest
-                grep -q 'PATH=\$HOME/bin' ~/.bashrc || \
-                    echo 'export PATH=\$HOME/bin:\$PATH' >> ~/.bashrc
+                case \"\$(uname -m)\" in
+                    x86_64)  GO_ARCH=amd64 ;;
+                    aarch64) GO_ARCH=arm64 ;;
+                    *) echo 'unknown arch: '\$(uname -m); exit 1 ;;
+                esac
+                if ! /usr/local/go/bin/go version 2>/dev/null | grep -q 'go${GO_VER}'; then
+                    curl -sSLO https://go.dev/dl/go${GO_VER}.linux-\${GO_ARCH}.tar.gz
+                    sudo rm -rf /usr/local/go
+                    sudo tar -C /usr/local -xzf go${GO_VER}.linux-\${GO_ARCH}.tar.gz
+                    rm -f go${GO_VER}.linux-\${GO_ARCH}.tar.gz
+                fi
+                export PATH=/usr/local/go/bin:\$HOME/bin:\$PATH
+                GOBIN=\$HOME/bin /usr/local/go/bin/go install github.com/rakyll/hey@latest
+                grep -q '/usr/local/go/bin' ~/.bashrc || \
+                    echo 'export PATH=/usr/local/go/bin:\$HOME/bin:\$PATH' >> ~/.bashrc
             " 2>&1 | tag "$h"
         ) &
         pids+=($!)
@@ -221,16 +236,21 @@ cmd_run_observer() {
     for h in "${OBSERVER_HOSTS[@]}"; do
         (
             echo "[$h] push prometheus.yml + start prometheus + grafana"
-            ssh_run "$h" "mkdir -p ~/observer" 2>&1 | tag "$h"
-            scp_to "$cfg" "$h" "observer/prometheus.yml" 2>&1 | tag "$h"
+            # Stage in /tmp (writable by SSH user) then move to /etc/prometheus
+            # so the container's 'nobody' uid can read it — $HOME is 0750 on
+            # Ubuntu and blocks traversal for uid 65534.
+            scp_to "$cfg" "$h" "/tmp/prometheus.yml" 2>&1 | tag "$h"
             ssh_run "$h" "
                 set -e
+                sudo mkdir -p /etc/prometheus
+                sudo mv /tmp/prometheus.yml /etc/prometheus/prometheus.yml
+                sudo chmod 644 /etc/prometheus/prometheus.yml
                 sudo docker pull -q prom/prometheus
                 sudo docker pull -q grafana/grafana
                 sudo docker rm -f prometheus grafana 2>/dev/null || true
                 sudo docker run -d --restart=unless-stopped --name prometheus \
                     --network host \
-                    -v \$HOME/observer/prometheus.yml:/etc/prometheus/prometheus.yml \
+                    -v /etc/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro \
                     prom/prometheus
                 sudo docker run -d --restart=unless-stopped --name grafana \
                     --network host \
