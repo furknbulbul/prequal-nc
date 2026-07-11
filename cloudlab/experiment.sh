@@ -234,8 +234,8 @@ SUMMARY="$OUT/summary.tsv"
 
 echo "algorithm,level_pct,target_qps,t_start_unix,t_end_unix" > "$WINDOWS"
 printf "algorithm\tlevel_pct\ttarget_qps\trps\tp50_ms\tp90_ms\tp99_ms\terror_pct\n" > "$SUMMARY"
-
-LEVELS_PCT=(75 83 93 103 114 127 141 157 174)
+# 93 103 114 127 141 157
+LEVELS_PCT=(30 103)
 
 # Phased ramp: run RR through all 9 levels back-to-back (no gap between
 # levels, like the paper's continuous ramp), then a single break, then
