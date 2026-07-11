@@ -5,10 +5,17 @@ import (
 )
 
 type Metrics struct {
-	requestDuration *prometheus.HistogramVec
-	activeRequests  *prometheus.GaugeVec
-	serverHealth    *prometheus.GaugeVec
-	serverRIF       *prometheus.GaugeVec
+	requestDuration  *prometheus.HistogramVec
+	activeRequests   *prometheus.GaugeVec
+	serverHealth     *prometheus.GaugeVec
+	serverRIF        *prometheus.GaugeVec
+	probesTriggered  *prometheus.CounterVec
+	probesSucceeded  *prometheus.CounterVec
+	probesFailed     *prometheus.CounterVec
+	probeDuration    *prometheus.HistogramVec
+	probeInflight    *prometheus.GaugeVec
+	poolSize         *prometheus.GaugeVec
+	pickClass        *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -42,12 +49,69 @@ func NewMetrics() *Metrics {
 			},
 			[]string{"server_id", "algorithm"},
 		),
+		probesTriggered: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "prequal_probes_triggered_total",
+				Help: "Probes initiated by the LB",
+			},
+			[]string{"algorithm"},
+		),
+		probesSucceeded: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "prequal_probes_succeeded_total",
+				Help: "Probes that returned a valid result",
+			},
+			[]string{"algorithm"},
+		),
+		probesFailed: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "prequal_probes_failed_total",
+				Help: "Probes that errored or timed out",
+			},
+			[]string{"algorithm", "reason"},
+		),
+		probeDuration: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "prequal_probe_duration_seconds",
+				Help:    "End-to-end wall time of a /health probe from the LB",
+				Buckets: []float64{.0005, .001, .002, .005, .01, .025, .05, .1, .2, .5, 1, 2},
+			},
+			[]string{"algorithm"},
+		),
+		probeInflight: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "prequal_probes_inflight",
+				Help: "Currently in-flight probe requests",
+			},
+			[]string{"algorithm"},
+		),
+		poolSize: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "prequal_pool_size",
+				Help: "Current entries in the probe pool",
+			},
+			[]string{"algorithm"},
+		),
+		pickClass: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "prequal_pick_class_total",
+				Help: "Picks broken down by HCL class (cold, hot, no-pool, no-winner)",
+			},
+			[]string{"algorithm", "class"},
+		),
 	}
 
 	prometheus.MustRegister(m.requestDuration)
 	prometheus.MustRegister(m.activeRequests)
 	prometheus.MustRegister(m.serverHealth)
 	prometheus.MustRegister(m.serverRIF)
+	prometheus.MustRegister(m.probesTriggered)
+	prometheus.MustRegister(m.probesSucceeded)
+	prometheus.MustRegister(m.probesFailed)
+	prometheus.MustRegister(m.probeDuration)
+	prometheus.MustRegister(m.probeInflight)
+	prometheus.MustRegister(m.poolSize)
+	prometheus.MustRegister(m.pickClass)
 
 	return m
 }

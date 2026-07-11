@@ -6,6 +6,7 @@ RUN go mod init backend && \
     CGO_ENABLED=0 go build -o backend main.go
 
 FROM alpine:latest
+RUN apk add --no-cache stress-ng
 WORKDIR /app
 COPY --from=builder /app/backend .
 CMD ["./backend"]

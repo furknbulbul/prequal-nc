@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"sort"
 	"strconv"
 	"sync"
@@ -18,8 +19,9 @@ import (
 var inflight int32
 
 const (
-	latencyRingSize = 4096
-	rifWindowDelta  = 1
+	latencyRingSize = 256
+	rifWindowDelta  = 10
+	workMean        = 4000.0
 )
 
 type latencySample struct {
@@ -62,21 +64,86 @@ func medianLatencyMs(currentRif int32) int64 {
 	}
 	latencyRingMutex.Unlock()
 
-	samples := near
-	if len(samples) == 0 {
-		samples = all
+	// if there is no sample near RIF value, just return the average latency
+	if len(near) == 0 {
+		if len(all) == 0 {
+			return 0
+		}
+		var sum int64
+		for _, v := range all {
+			sum += v
+		}
+		return sum / int64(len(all))
 	}
-	if len(samples) == 0 {
+	sort.Slice(near, func(i, j int) bool { return near[i] < near[j] })
+	return near[len(near)/2]
+}
+
+func runAntagonist(cpuLoad int, serverID string) {
+	if cpuLoad <= 0 {
+		return
+	}
+	if cpuLoad > 100 {
+		cpuLoad = 100
+	}
+	const cyclePeriodSeconds = 10
+	onSec := cyclePeriodSeconds * cpuLoad / 100
+	offSec := cyclePeriodSeconds - onSec
+
+	// Phase offset: explicit ANTAGONIST_PHASE env var wins; fall back to
+	// SERVER_ID-based stagger so unstaggered setups still work.
+	phaseOffsetSec := extractServerNum(serverID) % cyclePeriodSeconds
+	if v := os.Getenv("ANTAGONIST_PHASE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			phaseOffsetSec = ((n % cyclePeriodSeconds) + cyclePeriodSeconds) % cyclePeriodSeconds
+		}
+	}
+
+	now := time.Now()
+	secOfCycle := int(now.Unix()) % cyclePeriodSeconds
+	delayToNextStart := (phaseOffsetSec - secOfCycle + cyclePeriodSeconds) % cyclePeriodSeconds
+	time.Sleep(time.Duration(delayToNextStart) * time.Second)
+
+	for {
+		if onSec > 0 {
+			cmd := exec.Command("stress-ng",
+				"--cpu", "1",
+				"--cpu-method", "matrixprod",
+				"--timeout", fmt.Sprintf("%ds", onSec),
+			)
+			cmd.Stdout = os.Stderr
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				log.Printf("antagonist stress-ng exited: %v", err)
+			}
+		}
+		if offSec > 0 {
+			time.Sleep(time.Duration(offSec) * time.Second)
+		}
+	}
+}
+
+// extractServerNum pulls the trailing integer from an ID like "server3"
+// so we can use it as a stagger offset. Returns 0 if no integer suffix.
+func extractServerNum(id string) int {
+	i := len(id)
+	for i > 0 && id[i-1] >= '0' && id[i-1] <= '9' {
+		i--
+	}
+	if i == len(id) {
 		return 0
 	}
-	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-	return samples[len(samples)/2]
+	n, err := strconv.Atoi(id[i:])
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func main() {
 	port := os.Getenv("PORT")
 	serverID := os.Getenv("SERVER_ID")
-	
+
 	cpuLoad := 0
 	if loadStr := os.Getenv("CPU_LOAD"); loadStr != "" {
 		if val, err := strconv.Atoi(loadStr); err == nil {
@@ -84,7 +151,9 @@ func main() {
 		}
 	}
 
-	workMean := 1000.0
+	if cpuLoad > 0 {
+		go runAntagonist(cpuLoad, serverID)
+	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		rifAtArrival := atomic.AddInt32(&inflight, 1)
@@ -99,13 +168,6 @@ func main() {
 		for i := 0; i < work; i++ {
 			hash := sha256.Sum256([]byte(fmt.Sprintf("%d-%d", time.Now().UnixNano(), i)))
 			_ = hex.EncodeToString(hash[:])
-		}
-
-		if cpuLoad > 0 {
-			baseDelay := 10 * time.Millisecond
-			additionalDelay := time.Duration(float64(cpuLoad)/100.0*30) * time.Millisecond
-			variance := time.Duration(rand.Intn(5)) * time.Millisecond
-			time.Sleep(baseDelay + additionalDelay + variance)
 		}
 
 		duration := time.Since(start)
@@ -126,13 +188,6 @@ func main() {
 	})
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if cpuLoad > 0 {
-			baseDelay := 10 * time.Millisecond
-			additionalDelay := time.Duration(float64(cpuLoad)/100.0*30) * time.Millisecond
-			variance := time.Duration(rand.Intn(5)) * time.Millisecond
-			time.Sleep(baseDelay + additionalDelay + variance)
-		}
-
 		w.Header().Set("Content-Type", "application/json")
 		currentRif := atomic.LoadInt32(&inflight)
 		w.Header().Set("X-Requests-In-Flight", strconv.FormatInt(int64(currentRif), 10))

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Render Figure 6 from a results/figure6/<ts>/ directory.
+"""Render Figure 6 from a results/experiment/<ts>/ directory.
 
 Inputs:
-  results_dir          directory produced by figure6.sh, containing
+  results_dir          directory produced by experiment.sh, containing
                        windows.csv, summary.tsv, prequal_*.txt, rr_*.txt.
 
 Outputs in the same directory:
-  figure6.png          three-panel plot: tail latency, error rate, CPU box.
+  experiment.png          three-panel plot: tail latency, error rate, CPU box.
   cpu_samples.csv      raw per-srv CPU% samples used to draw panel (c).
 
 Latency and errors come from summary.tsv (parsed from `hey` output).
@@ -14,7 +14,7 @@ CPU utilization is queried from Prometheus (node_exporter) per (algo, level)
 window, gathering samples across all srv-* instances.
 
 Usage:
-  python3 plot_figure6.py RESULTS_DIR [--prom URL]
+  python3 plot_experiment.py RESULTS_DIR [--prom URL]
 """
 
 import argparse
@@ -44,8 +44,8 @@ def load_summary(path: Path):
                 "qps": int(r["target_qps"]),
                 "rps": float(r["rps"]),
                 "p50": float(r["p50_ms"]),
+                "p90": float(r["p90_ms"]),
                 "p99": float(r["p99_ms"]),
-                "p999": float(r["p999_ms"]),
                 "err_pct": float(r["error_pct"]),
             })
     return rows
@@ -117,8 +117,8 @@ def main():
     # --- Panel (a): tail latency, log scale ---
     ax = axes[0]
     for stat, color in [("p50", "tab:blue"),
-                        ("p99", "tab:green"),
-                        ("p999", "tab:red")]:
+                        ("p90", "tab:orange"),
+                        ("p99", "tab:green")]:
         rr_vals = [rr[l][stat] for l in levels]
         pre_vals = [pre[l][stat] for l in levels]
         ax.plot(x, rr_vals, "--o", color=color, label=f"RR {stat}", alpha=0.7)
@@ -187,7 +187,7 @@ def main():
     axes[-1].set_xlabel("Offered load (% of baseline capacity)")
 
     fig.tight_layout()
-    out_png = out_dir / "figure6.png"
+    out_png = out_dir / "experiment.png"
     fig.savefig(out_png, dpi=150)
     print(f"Wrote {out_png}")
 
