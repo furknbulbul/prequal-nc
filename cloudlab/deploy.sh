@@ -9,8 +9,7 @@
 #   ./cloudlab/deploy.sh sync          # rsync this repo to every node
 #   ./cloudlab/deploy.sh build         # build LB + backend docker images
 #   ./cloudlab/deploy.sh run           # start backends, LBs, observer, clients
-#   ./cloudlab/deploy.sh antagonist    # start stress-ng on configured srv nodes
-#   ./cloudlab/deploy.sh stop-antagonist
+#   ./cloudlab/deploy.sh run-lbs       # restart just the LB containers
 #   ./cloudlab/deploy.sh verify        # health-check every component
 #   ./cloudlab/deploy.sh teardown      # stop + remove all containers
 #   ./cloudlab/deploy.sh all           # bootstrap; sync; build; run; verify
@@ -135,13 +134,15 @@ cmd_run_backends() {
         local h=${SRV_HOSTS[$i]}
         local idx=$((i + 1))
         local load=${SRV_CPU_LOADS[$i]:-0}
+        local phase=${SRV_ANTAGONIST_PHASES[$i]:-0}
         (
-            echo "[$h] run backend srv-$idx (CPU_LOAD=$load)"
+            echo "[$h] run backend srv-$idx (CPU_LOAD=$load ANTAGONIST_PHASE=$phase)"
             ssh_run "$h" "
                 sudo docker rm -f backend 2>/dev/null || true
                 sudo docker run -d --restart=unless-stopped --name backend \
                     --network host \
                     -e SERVER_ID=srv-$idx -e PORT=$BACKEND_PORT -e CPU_LOAD=$load \
+                    -e ANTAGONIST_PHASE=$phase \
                     prequal-backend
             " 2>&1 | tag "$h"
         ) &
@@ -172,15 +173,23 @@ cmd_run_node_exporters() {
 }
 
 cmd_run_lbs() {
+    # LB observability + probe-mode knobs. All optional; defaults preserve
+    # perf-mode behaviour (no metrics, no pick log, per-query probes).
+    local lb_metrics="${LB_METRICS:-0}"
+    local lb_pick_log="${LB_PICK_LOG:-0}"
+    local lb_probe_mode="${LB_PROBE_MODE:-per_query}"
+    local lb_probe_interval_ms="${LB_PROBE_INTERVAL_MS:-1000}"
     local pids=()
     for h in "${PREQUAL_HOSTS[@]}"; do
         (
-            echo "[$h] run prequal LB"
+            echo "[$h] run prequal LB (metrics=$lb_metrics picklog=$lb_pick_log probe=$lb_probe_mode/$lb_probe_interval_ms ms)"
             ssh_run "$h" "
                 sudo docker rm -f lb 2>/dev/null || true
                 sudo docker run -d --restart=unless-stopped --name lb \
                     --network host \
                     -e LB_ALGORITHM=prequal -e BACKEND_SERVERS='$BACKENDS' \
+                    -e LB_METRICS=$lb_metrics -e LB_PICK_LOG=$lb_pick_log \
+                    -e LB_PROBE_MODE=$lb_probe_mode -e LB_PROBE_INTERVAL_MS=$lb_probe_interval_ms \
                     prequal-lb
             " 2>&1 | tag "$h"
         ) &
@@ -188,12 +197,13 @@ cmd_run_lbs() {
     done
     for h in "${RR_HOSTS[@]}"; do
         (
-            echo "[$h] run RR LB"
+            echo "[$h] run RR LB (metrics=$lb_metrics picklog=$lb_pick_log)"
             ssh_run "$h" "
                 sudo docker rm -f lb 2>/dev/null || true
                 sudo docker run -d --restart=unless-stopped --name lb \
                     --network host \
                     -e LB_ALGORITHM=roundrobin -e BACKEND_SERVERS='$BACKENDS' \
+                    -e LB_METRICS=$lb_metrics -e LB_PICK_LOG=$lb_pick_log \
                     prequal-lb
             " 2>&1 | tag "$h"
         ) &
@@ -304,43 +314,6 @@ cmd_run() {
     cmd_run_observer
 }
 
-cmd_antagonist() {
-    # Background stress-ng on each srv-* per SRV_ANTAGONIST_CPUS.
-    # Cycles 60s on / 30s off so contention is bursty, like the paper's
-    # "unpredictable time-varying antagonist load".
-    local pids=()
-    for i in "${!SRV_HOSTS[@]}"; do
-        local h=${SRV_HOSTS[$i]}
-        local n=${SRV_ANTAGONIST_CPUS[$i]:-0}
-        if [ "$n" -eq 0 ]; then continue; fi
-        (
-            echo "[$h] antagonist start (cpu=$n)"
-            ssh_run "$h" "
-                sudo docker rm -f antagonist 2>/dev/null || true
-                sudo docker run -d --restart=unless-stopped --name antagonist \
-                    --network host \
-                    --entrypoint /bin/sh \
-                    alpine:3 \
-                    -c 'apk add --no-cache stress-ng >/dev/null && \
-                        while :; do stress-ng --cpu $n --timeout 60s >/dev/null 2>&1; sleep 30; done'
-            " 2>&1 | tag "$h"
-        ) &
-        pids+=($!)
-    done
-    pwait "${pids[@]}"
-}
-
-cmd_stop_antagonist() {
-    local pids=()
-    for h in "${SRV_HOSTS[@]}"; do
-        (
-            ssh_run "$h" "sudo docker rm -f antagonist 2>/dev/null || true" 2>&1 | tag "$h"
-        ) &
-        pids+=($!)
-    done
-    pwait "${pids[@]}"
-}
-
 check_host() {
     local h=$1 url=$2 label=$3
     if ssh_run "$h" "curl -fsS '$url' -o /dev/null"; then
@@ -399,8 +372,7 @@ case "${1:-help}" in
     sync)             cmd_sync ;;
     build)            cmd_build ;;
     run)              cmd_run ;;
-    antagonist)       cmd_antagonist ;;
-    stop-antagonist)  cmd_stop_antagonist ;;
+    run-lbs)          cmd_run_lbs ;;
     verify)           cmd_verify ;;
     teardown)         cmd_teardown ;;
     all)

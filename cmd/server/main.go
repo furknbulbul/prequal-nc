@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -22,6 +25,11 @@ const (
 )
 
 func main() {
+	// Enable mutex + block profiling so /debug/pprof/mutex and /debug/pprof/block
+	// return meaningful data. Off by default in Go.
+	runtime.SetMutexProfileFraction(5)
+	runtime.SetBlockProfileRate(1_000_000)
+
 	ctx := context.Background()
 	port := flag.String("port", "8080", "Port to listen on")
 	algorithm := flag.String("algorithm", "prequal", "Load balancing algorithm (prequal or roundrobin)")
@@ -35,10 +43,41 @@ func main() {
 
 	config := loadbalancer.DefaultConfig()
 	config.Algorithm = loadbalancer.Algorithm(algo)
+	// Env-var overrides for observation gates. Any of "1", "true", "yes"
+	// (case-insensitive) enables; any other non-empty value disables.
+	if v, ok := os.LookupEnv("LB_METRICS"); ok {
+		config.EnableMetrics = parseBool(v)
+	}
+	if v, ok := os.LookupEnv("LB_PICK_LOG"); ok {
+		config.EnablePickLog = parseBool(v)
+	}
+	// Probe mode: "per_query" (default) or "ticker".
+	if v, ok := os.LookupEnv("LB_PROBE_MODE"); ok {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "ticker":
+			config.ProbeMode = loadbalancer.ProbeModeTicker
+		case "per_query", "perquery", "":
+			config.ProbeMode = loadbalancer.ProbeModePerQuery
+		default:
+			logger.Log(ctx, LevelFatal, "invalid LB_PROBE_MODE; use 'per_query' or 'ticker'")
+			os.Exit(1)
+		}
+	}
+	// Probe interval (ticker mode only). Value is in milliseconds.
+	if v, ok := os.LookupEnv("LB_PROBE_INTERVAL_MS"); ok {
+		if ms, err := time.ParseDuration(v + "ms"); err == nil && ms > 0 {
+			config.ProbeInterval = ms
+		}
+	}
 
 	lb := loadbalancer.NewLoadBalancer(config, logger)
 
-	logger.Info("Load balancer configured", slog.String("algorithm", string(config.Algorithm)))
+	logger.Info("Load balancer configured",
+		slog.String("algorithm", string(config.Algorithm)),
+		slog.String("probe_mode", string(config.ProbeMode)),
+		slog.Duration("probe_interval", config.ProbeInterval),
+		slog.Bool("enable_metrics", config.EnableMetrics),
+		slog.Bool("enable_pick_log", config.EnablePickLog))
 
 	backends := parseBackends(os.Getenv("BACKEND_SERVERS"))
 	if len(backends) == 0 {
@@ -48,9 +87,8 @@ func main() {
 
 	for i, addr := range backends {
 		lb.AddServer(&loadbalancer.Server{
-			ID:        fmt.Sprintf("server-%d", i),
-			Address:   addr,
-			IsHealthy: true,
+			ID:      fmt.Sprintf("server-%d", i),
+			Address: addr,
 		})
 	}
 	logger.Info("Registered backend servers", slog.Int("count", len(backends)))
@@ -58,6 +96,13 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/", lb)
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/debug/pprof/", http.DefaultServeMux)
+	mux.HandleFunc("/debug/pool", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(lb.DebugSnapshot())
+	})
 	server := &http.Server{
 		Addr:    ":" + *port,
 		Handler: mux,
@@ -81,6 +126,15 @@ func main() {
 	logger.Info("Starting server on port " + *port)
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		logger.Log(ctx, LevelFatal, "Server error")
+	}
+}
+
+func parseBool(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 
