@@ -303,4 +303,4 @@ echo "  windows.csv  -> $WINDOWS"
 echo "  summary.tsv  -> $SUMMARY"
 echo
 echo "Render figure with:"
-echo "  python3 cloudlab/plot_experiment.py $OUT --prom http://${OBSERVER_HOSTS[0]}:9090 --alloc-cores $ALLOC_CORES"
+echo "  python3 cloudlab/plot_experiment.py $OUT --ssh $CLOUDLAB_USER@${OBSERVER_HOSTS[0]} --alloc-cores $ALLOC_CORES"

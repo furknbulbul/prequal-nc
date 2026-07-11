@@ -17,11 +17,20 @@ by Prometheus). Like the paper, this excludes the antagonist and can exceed
 
 Usage:
   python3 plot_experiment.py RESULTS_DIR [--prom URL] [--alloc-cores N]
+  python3 plot_experiment.py RESULTS_DIR --ssh USER@OBSERVER [--alloc-cores N]
+
+Prefer --ssh: it tunnels to the observer's local Prometheus, avoiding the
+"Connection reset by peer" failures that hitting the public :9090 over the
+WAN produces (which otherwise leaves panel (c) / cpu_samples.csv empty).
 """
 
 import argparse
+import contextlib
 import csv
+import socket
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -33,6 +42,61 @@ CPU_QUERY = (
     '100 * rate(backend_cpu_seconds_total{{instance=~"{srv_re}"}}[15s])'
     ' / {alloc}'
 )
+
+SSH_OPTS = [
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "LogLevel=ERROR",
+    "-o", "ExitOnForwardFailure=yes",
+]
+
+
+def _free_local_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+@contextlib.contextmanager
+def resolve_prom(args):
+    """Yield a Prometheus base URL for the CPU queries.
+
+    With --ssh USER@HOST, open a local port-forward to the observer's
+    Prometheus and query it over that single persistent channel. This avoids
+    the "Connection reset by peer" failures seen when hitting the public
+    observer :9090 directly over the WAN. Without --ssh, use --prom as-is.
+    """
+    if not args.ssh:
+        yield args.prom
+        return
+
+    local_port = _free_local_port()
+    cmd = ["ssh", "-N", *SSH_OPTS,
+           "-L", f"{local_port}:localhost:{args.remote_prom_port}", args.ssh]
+    proc = subprocess.Popen(cmd)
+    try:
+        deadline = time.time() + 15
+        while True:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"ssh tunnel exited early (code {proc.returncode})")
+            try:
+                with socket.create_connection(("127.0.0.1", local_port),
+                                              timeout=1):
+                    break
+            except OSError:
+                if time.time() > deadline:
+                    raise RuntimeError("timed out waiting for ssh tunnel")
+                time.sleep(0.3)
+        yield f"http://127.0.0.1:{local_port}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 def load_summary(path: Path):
@@ -95,6 +159,12 @@ def main():
     ap.add_argument("results_dir", type=Path)
     ap.add_argument("--prom", default=None,
                     help="Prometheus URL, e.g. http://observer-1.utah.cloudlab.us:9090")
+    ap.add_argument("--ssh", default=None, metavar="USER@HOST",
+                    help="SSH into the observer and query its Prometheus over a "
+                         "local port-forward (avoids WAN connection resets). "
+                         "Overrides --prom.")
+    ap.add_argument("--remote-prom-port", type=int, default=9090,
+                    help="Prometheus port on the observer (used with --ssh)")
     ap.add_argument("--srv-regex", default="srv-.*:80",
                     help="instance label regex for the backend /metrics targets")
     ap.add_argument("--alloc-cores", type=float, default=2.0,
@@ -112,7 +182,7 @@ def main():
     pre = {r["level"]: r for r in summary if r["algorithm"] == "prequal"}
     rr = {r["level"]: r for r in summary if r["algorithm"] == "roundrobin"}
 
-    have_cpu = not args.no_cpu and args.prom is not None
+    have_cpu = not args.no_cpu and (args.prom is not None or args.ssh is not None)
     nrows = 3 if have_cpu else 2
     fig, axes = plt.subplots(nrows, 1, figsize=(11, 3.2 * nrows), sharex=True)
     if nrows == 1:
@@ -155,7 +225,7 @@ def main():
         cpu_path.write_text("algorithm,level_pct,instance,cpu_pct\n")
         cpu_by_algo_level = {("prequal", l): [] for l in levels}
         cpu_by_algo_level.update({("roundrobin", l): [] for l in levels})
-        with cpu_path.open("a") as f:
+        with resolve_prom(args) as prom_url, cpu_path.open("a") as f:
             for w in windows:
                 # Levels run back-to-back; the 15s rate() window at the start
                 # of a level still reflects the previous one, so trim it.
@@ -164,7 +234,7 @@ def main():
                     t0 += 15
                 try:
                     samples = query_cpu_samples(
-                        args.prom, t0, w["t_end"], args.srv_regex,
+                        prom_url, t0, w["t_end"], args.srv_regex,
                         args.alloc_cores)
                 except Exception as e:
                     print(f"warn: CPU query failed for "
