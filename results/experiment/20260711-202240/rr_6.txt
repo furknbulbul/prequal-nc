@@ -1,0 +1,10 @@
+Requests      [total, rate, throughput]         158221, 2637.06, 2318.53
+Duration      [total, attack, wait]             1m4s, 59.999s, 3.885s
+Latencies     [min, mean, 50, 90, 95, 99, max]  650.945µs, 690.811ms, 19.084ms, 3.215s, 5s, 5.001s, 5.014s
+Bytes In      [total, mean]                     31513429, 199.17
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           93.61%
+Status Codes  [code:count]                      0:9532  200:148117  504:572  
+Error Set:
+Get "http://lb-rr-1:8080/": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+504 Gateway Timeout

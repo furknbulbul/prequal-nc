@@ -10,7 +10,6 @@
 *.dylib
 loadbalancer
 .DS_Store
-results
 
 # Test binary, built with `go test -c`
 *.test
