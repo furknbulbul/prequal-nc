@@ -117,18 +117,6 @@
           "legendFormat": "{{algorithm}} p99",
           "range": true,
           "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.999, sum(rate(request_duration_seconds_bucket{algorithm=~\"$algorithm\"}[1m])) by (le, algorithm))",
-          "hide": false,
-          "legendFormat": "{{algorithm}} p99.9",
-          "range": true,
-          "refId": "D"
         }
       ],
       "title": "Request Latency (Percentiles)",

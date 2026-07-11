@@ -5,7 +5,7 @@ global:
 scrape_configs:
   - job_name: 'loadbalancer'
     static_configs:
-      - targets: ['loadbalancer-prequal:8080', 'loadbalancer-rr:8080']
+      - targets: ['lb-prequal-1:8080', 'lb-rr-1:8080']
     metrics_path: '/metrics'
 
   - job_name: 'prometheus'
