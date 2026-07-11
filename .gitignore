@@ -9,6 +9,7 @@
 *.so
 *.dylib
 loadbalancer
+.DS_Store
 
 # Test binary, built with `go test -c`
 *.test
@@ -31,3 +32,4 @@ go.work.sum
 backend/backend
 backend/go.mod
 backend/go.sum
+

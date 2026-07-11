@@ -82,6 +82,10 @@ echo "Generating $COMPOSE: $N_SERVERS servers, $N_LBS prequal LBs, $N_LBS RR LBs
         echo "    environment:"
         echo "      - BACKEND_SERVERS=${BACKENDS}"
         echo "      - LB_ALGORITHM=prequal"
+        echo "      - LB_METRICS=\${LB_METRICS:-0}"
+        echo "      - LB_PICK_LOG=\${LB_PICK_LOG:-0}"
+        echo "      - LB_PROBE_MODE=\${LB_PROBE_MODE:-per_query}"
+        echo "      - LB_PROBE_INTERVAL_MS=\${LB_PROBE_INTERVAL_MS:-1000}"
         echo "    depends_on:"
         for j in $(seq 1 "$N_SERVERS"); do
             echo "      - server${j}"
@@ -101,6 +105,10 @@ echo "Generating $COMPOSE: $N_SERVERS servers, $N_LBS prequal LBs, $N_LBS RR LBs
         echo "    environment:"
         echo "      - BACKEND_SERVERS=${BACKENDS}"
         echo "      - LB_ALGORITHM=roundrobin"
+        echo "      - LB_METRICS=\${LB_METRICS:-0}"
+        echo "      - LB_PICK_LOG=\${LB_PICK_LOG:-0}"
+        echo "      - LB_PROBE_MODE=\${LB_PROBE_MODE:-per_query}"
+        echo "      - LB_PROBE_INTERVAL_MS=\${LB_PROBE_INTERVAL_MS:-1000}"
         echo "    depends_on:"
         for j in $(seq 1 "$N_SERVERS"); do
             echo "      - server${j}"
@@ -108,11 +116,28 @@ echo "Generating $COMPOSE: $N_SERVERS servers, $N_LBS prequal LBs, $N_LBS RR LBs
         echo ""
     done
 
+    # First pass: figure out how many antagonists there are so we can stagger
+    # their phase offsets evenly across the 10s cycle.
+    n_antagonists=0
+    for i in $(seq 1 "$N_SERVERS"); do
+        if [ $((i % 3)) -ne 0 ]; then
+            n_antagonists=$((n_antagonists + 1))
+        fi
+    done
+    antagonist_idx=0
     for i in $(seq 1 "$N_SERVERS"); do
         if [ $((i % 3)) -eq 0 ]; then
             cpu_load=0
+            phase=0
         else
             cpu_load=60
+            # Evenly-spaced phase offset for this antagonist within the 10s cycle.
+            if [ "$n_antagonists" -gt 0 ]; then
+                phase=$(( antagonist_idx * 10 / n_antagonists ))
+            else
+                phase=0
+            fi
+            antagonist_idx=$((antagonist_idx + 1))
         fi
         echo "  server${i}:"
         echo "    build: ./backend"
@@ -123,6 +148,7 @@ echo "Generating $COMPOSE: $N_SERVERS servers, $N_LBS prequal LBs, $N_LBS RR LBs
         echo "      - SERVER_ID=server${i}"
         echo "      - PORT=80"
         echo "      - CPU_LOAD=${cpu_load}"
+        echo "      - ANTAGONIST_PHASE=${phase}"
         echo "    cpus: 1.0"
         echo ""
     done
