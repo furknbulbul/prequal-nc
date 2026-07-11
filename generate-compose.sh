@@ -149,6 +149,9 @@ echo "Generating $COMPOSE: $N_SERVERS servers, $N_LBS prequal LBs, $N_LBS RR LBs
         echo "      - PORT=80"
         echo "      - CPU_LOAD=${cpu_load}"
         echo "      - ANTAGONIST_PHASE=${phase}"
+        # Local containers are capped at 1 CPU; the CloudLab default of 6
+        # antagonist cores makes no sense here.
+        echo "      - ANTAGONIST_CORES=1"
         echo "    cpus: 1.0"
         echo ""
     done

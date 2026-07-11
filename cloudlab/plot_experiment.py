@@ -3,18 +3,20 @@
 
 Inputs:
   results_dir          directory produced by experiment.sh, containing
-                       windows.csv, summary.tsv, prequal_*.txt, rr_*.txt.
+                       windows.csv, summary.tsv, prequal_*.json, rr_*.json.
 
 Outputs in the same directory:
-  experiment.png          three-panel plot: tail latency, error rate, CPU box.
+  experiment.png       three-panel plot: tail latency, error rate, CPU box.
   cpu_samples.csv      raw per-srv CPU% samples used to draw panel (c).
 
-Latency and errors come from summary.tsv (parsed from `hey` output).
-CPU utilization is queried from Prometheus (node_exporter) per (algo, level)
-window, gathering samples across all srv-* instances.
+Latency and errors come from summary.tsv (parsed from vegeta JSON reports).
+Panel (c) plots the SERVING PROCESS's CPU as a percentage of its declared
+allocation (backend_cpu_seconds_total from the backend's /metrics, scraped
+by Prometheus). Like the paper, this excludes the antagonist and can exceed
+100% when a replica bursts above its allocation into idle machine capacity.
 
 Usage:
-  python3 plot_experiment.py RESULTS_DIR [--prom URL]
+  python3 plot_experiment.py RESULTS_DIR [--prom URL] [--alloc-cores N]
 """
 
 import argparse
@@ -28,8 +30,8 @@ import numpy as np
 
 
 CPU_QUERY = (
-    '100 * (1 - avg by (instance) '
-    '(rate(node_cpu_seconds_total{{mode="idle",instance=~"{srv_re}"}}[15s])))'
+    '100 * rate(backend_cpu_seconds_total{{instance=~"{srv_re}"}}[15s])'
+    ' / {alloc}'
 )
 
 
@@ -65,8 +67,9 @@ def load_windows(path: Path):
     return wins
 
 
-def query_cpu_samples(prom_url: str, t_start: int, t_end: int, srv_re: str):
-    q = CPU_QUERY.format(srv_re=srv_re)
+def query_cpu_samples(prom_url: str, t_start: int, t_end: int, srv_re: str,
+                      alloc_cores: float):
+    q = CPU_QUERY.format(srv_re=srv_re, alloc=alloc_cores)
     r = requests.get(
         prom_url.rstrip("/") + "/api/v1/query_range",
         params={"query": q, "start": t_start, "end": t_end, "step": "5s"},
@@ -92,8 +95,11 @@ def main():
     ap.add_argument("results_dir", type=Path)
     ap.add_argument("--prom", default=None,
                     help="Prometheus URL, e.g. http://observer-1.utah.cloudlab.us:9090")
-    ap.add_argument("--srv-regex", default="srv-.*:9100",
-                    help="instance label regex for node_exporter on srv-* nodes")
+    ap.add_argument("--srv-regex", default="srv-.*:80",
+                    help="instance label regex for the backend /metrics targets")
+    ap.add_argument("--alloc-cores", type=float, default=2.0,
+                    help="declared CPU allocation per backend, in cores "
+                         "(must match ALLOC_CORES used by experiment.sh)")
     ap.add_argument("--no-cpu", action="store_true",
                     help="skip CPU panel (no Prometheus needed)")
     args = ap.parse_args()
@@ -151,9 +157,15 @@ def main():
         cpu_by_algo_level.update({("roundrobin", l): [] for l in levels})
         with cpu_path.open("a") as f:
             for w in windows:
+                # Levels run back-to-back; the 15s rate() window at the start
+                # of a level still reflects the previous one, so trim it.
+                t0 = w["t_start"]
+                if w["t_end"] - t0 > 30:
+                    t0 += 15
                 try:
                     samples = query_cpu_samples(
-                        args.prom, w["t_start"], w["t_end"], args.srv_regex)
+                        args.prom, t0, w["t_end"], args.srv_regex,
+                        args.alloc_cores)
                 except Exception as e:
                     print(f"warn: CPU query failed for "
                           f"{w['algorithm']} {w['level']}%: {e}",
@@ -177,14 +189,19 @@ def main():
         for patch in bp_pre["boxes"]:
             patch.set_facecolor("white")
             patch.set_hatch("//")
-        ax.set_ylabel("CPU utilization (%)")
-        ax.set_title("CPU distribution across backends")
-        ax.set_ylim(0, 105)
+        ax.set_ylabel("Backend CPU (% of allocation)")
+        ax.set_title("Serving-job CPU distribution across backends "
+                     "(can exceed 100% of allocation)")
+        all_vals = [v for data in (rr_data, pre_data) for lst in data
+                    for v in lst]
+        top = max(all_vals) if all_vals else 100.0
+        ax.set_ylim(0, max(105.0, top * 1.08))
+        ax.axhline(100, color="red", linewidth=0.8, linestyle="--", alpha=0.6)
         ax.grid(True, axis="y", linestyle=":", alpha=0.5)
 
     axes[-1].set_xticks(x)
     axes[-1].set_xticklabels([f"{l}%" for l in levels])
-    axes[-1].set_xlabel("Offered load (% of baseline capacity)")
+    axes[-1].set_xlabel("Offered load (% of aggregate allocation)")
 
     fig.tight_layout()
     out_png = out_dir / "experiment.png"

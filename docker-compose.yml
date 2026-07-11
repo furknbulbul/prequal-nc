@@ -58,6 +58,7 @@ services:
       - PORT=80
       - CPU_LOAD=50
       - ANTAGONIST_PHASE=0
+      - ANTAGONIST_CORES=1
     cpus: 1.0
 
   server2:
@@ -70,6 +71,7 @@ services:
       - PORT=80
       - CPU_LOAD=80
       - ANTAGONIST_PHASE=1
+      - ANTAGONIST_CORES=1
     cpus: 1.0
 
   server3:
@@ -93,6 +95,7 @@ services:
       - PORT=80
       - CPU_LOAD=50
       - ANTAGONIST_PHASE=3
+      - ANTAGONIST_CORES=1
     cpus: 1.0
 
   server5:
@@ -105,6 +108,7 @@ services:
       - PORT=80
       - CPU_LOAD=80
       - ANTAGONIST_PHASE=5
+      - ANTAGONIST_CORES=1
     cpus: 1.0
 
   server6:
@@ -128,6 +132,7 @@ services:
       - PORT=80
       - CPU_LOAD=50
       - ANTAGONIST_PHASE=6
+      - ANTAGONIST_CORES=1
     cpus: 1.0
 
   server8:
@@ -140,6 +145,7 @@ services:
       - PORT=80
       - CPU_LOAD=80
       - ANTAGONIST_PHASE=8
+      - ANTAGONIST_CORES=1
     cpus: 1.0
 
   prometheus:

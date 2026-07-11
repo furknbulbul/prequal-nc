@@ -180,32 +180,25 @@ LEVELS_PCT=(75  103  127 174)
 
 parse_hey() {
     local f=$1
-    local rps p50 p90 p99 errpct nonok errs total
+    local rps p50 p90 p99 errpct
     rps=$(awk '/Requests\/sec:/ {printf "%.2f", $2; exit}' "$f")
     p50=$(awk '/  50%+ in/ {printf "%.3f", $3*1000; exit}' "$f")
     p90=$(awk '/  90%+ in/ {printf "%.3f", $3*1000; exit}' "$f")
     p99=$(awk '/  99%+ in/ {printf "%.3f", $3*1000; exit}' "$f")
-    total=$(awk '/Total responses:/ {print $3; exit} /Total:/ {print $2; exit}' "$f")
-    nonok=$(awk '
-        /Status code distribution:/ {flag=1; next}
-        flag && /^$/ {flag=0}
-        flag && /\[[0-9]+\]/ {
-            code=$2+0; n=$1+0;
-            if (code < 200 || code >= 300) sum += n;
-        }
-        END {print sum+0}' "$f")
-    errs=$(awk '
-        /Error distribution:/ {flag=1; next}
-        flag && /^$/ {flag=0}
-        flag && /\[[0-9]+\]/ {sum += $1+0}
-        END {print sum+0}' "$f")
-    if [ -z "$total" ] || [ "$total" = "0" ] || [ "$total" = "0.0000" ]; then
-        errpct="0.000"
-    else
-        errpct=$(awk -v n="$nonok" -v e="$errs" -v t="$total" 'BEGIN {printf "%.3f", 100*(n+e)/t}')
-    fi
+    # hey prints no total-responses line ("Total:" is elapsed seconds), so
+    # total = sum of status-code counts + error counts. Lines look like
+    # "  [200] 1234 responses" / "  [12]  Get ...: timeout"; the count is
+    # in different fields per section, and the brackets must be stripped
+    # before awk can treat the values as numbers.
+    errpct=$(awk '
+        /Status code distribution:/ {sec=1; next}
+        /Error distribution:/       {sec=2; next}
+        $1 !~ /^\[/                 {sec=0}
+        sec==1 { c=$1; gsub(/[\[\]]/,"",c); n=$2+0; total+=n; if (c+0 < 200 || c+0 >= 300) bad+=n }
+        sec==2 { c=$1; gsub(/[\[\]]/,"",c); total+=c+0; bad+=c+0 }
+        END { if (total > 0) printf "%.3f", 100*bad/total; else printf "0.000" }' "$f")
     printf "%s\t%s\t%s\t%s\n" "${rps:-0}" "${p50:-0}" "${p90:-0}" "${p99:-0}"
-    echo "$errpct"
+    echo "${errpct:-0.000}"
 }
 
 # Ramp one algorithm across all levels, back-to-back, no inter-level gap.

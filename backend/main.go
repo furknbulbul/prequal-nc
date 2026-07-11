@@ -13,19 +13,27 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
-var inflight int32
+var (
+	inflight       int32
+	requestsTotal  uint64
+	cancelledTotal uint64
+)
 
 const (
 	latencyRingSize = 256
-	rifWindowDelta  = 10
+	rifWindowDelta  = 2 // "latency at (or near) the current RIF"
 	workMean        = 4000.0
+	// How often the work loop polls for cancellation. Coarse enough to be
+	// free, fine enough that abandoned queries stop burning CPU quickly.
+	cancelCheckEvery = 256
 )
 
 type latencySample struct {
-	latencyMs    int64
+	latencyUs    int64
 	rifAtArrival int32
 }
 
@@ -36,56 +44,75 @@ var (
 	latencyRingMutex sync.Mutex
 )
 
-func recordLatency(latencyMs int64, rifAtArrival int32) {
+func recordLatency(latencyUs int64, rifAtArrival int32) {
 	latencyRingMutex.Lock()
 	defer latencyRingMutex.Unlock()
-	latencyRing[latencyRingIdx] = latencySample{latencyMs, rifAtArrival}
+	latencyRing[latencyRingIdx] = latencySample{latencyUs, rifAtArrival}
 	latencyRingIdx = (latencyRingIdx + 1) % latencyRingSize
 	if latencyRingFill < latencyRingSize {
 		latencyRingFill++
 	}
 }
 
-func medianLatencyMs(currentRif int32) int64 {
+func medianLatencyUs(currentRif int32) int64 {
 	latencyRingMutex.Lock()
 	n := latencyRingFill
 	all := make([]int64, 0, n)
 	near := make([]int64, 0, n)
 	for i := 0; i < n; i++ {
 		s := latencyRing[i]
-		all = append(all, s.latencyMs)
+		all = append(all, s.latencyUs)
 		d := s.rifAtArrival - currentRif
 		if d < 0 {
 			d = -d
 		}
 		if d <= rifWindowDelta {
-			near = append(near, s.latencyMs)
+			near = append(near, s.latencyUs)
 		}
 	}
 	latencyRingMutex.Unlock()
 
-	// if there is no sample near RIF value, just return the average latency
+	// If there is no sample near the current RIF, fall back to the median
+	// over all recent samples (median for outlier robustness, per paper).
 	if len(near) == 0 {
 		if len(all) == 0 {
 			return 0
 		}
-		var sum int64
-		for _, v := range all {
-			sum += v
-		}
-		return sum / int64(len(all))
+		sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+		return all[len(all)/2]
 	}
 	sort.Slice(near, func(i, j int) bool { return near[i] < near[j] })
 	return near[len(near)/2]
 }
 
-func runAntagonist(cpuLoad int, serverID string) {
-	if cpuLoad <= 0 {
+// runAntagonist emulates a co-tenant competing for the machine's CPU.
+// cpuLoad is the duty cycle (0-100) of a 10s period; cores is how many CPUs
+// stress-ng pins while "on". cpuLoad=100 runs a constant antagonist, so the
+// replica's effective capacity is permanently machine_cores - cores.
+func runAntagonist(cpuLoad, cores int, serverID string) {
+	if cpuLoad <= 0 || cores <= 0 {
 		return
 	}
 	if cpuLoad > 100 {
 		cpuLoad = 100
 	}
+
+	if cpuLoad == 100 {
+		for {
+			cmd := exec.Command("stress-ng",
+				"--cpu", strconv.Itoa(cores),
+				"--cpu-method", "matrixprod",
+				"--timeout", "0", // run forever
+			)
+			cmd.Stdout = os.Stderr
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				log.Printf("antagonist stress-ng exited: %v", err)
+			}
+			time.Sleep(time.Second) // relaunch guard
+		}
+	}
+
 	const cyclePeriodSeconds = 10
 	onSec := cyclePeriodSeconds * cpuLoad / 100
 	offSec := cyclePeriodSeconds - onSec
@@ -107,7 +134,7 @@ func runAntagonist(cpuLoad int, serverID string) {
 	for {
 		if onSec > 0 {
 			cmd := exec.Command("stress-ng",
-				"--cpu", "1",
+				"--cpu", strconv.Itoa(cores),
 				"--cpu-method", "matrixprod",
 				"--timeout", fmt.Sprintf("%ds", onSec),
 			)
@@ -140,6 +167,10 @@ func extractServerNum(id string) int {
 	return n
 }
 
+func tvSeconds(tv syscall.Timeval) float64 {
+	return float64(tv.Sec) + float64(tv.Usec)/1e6
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	serverID := os.Getenv("SERVER_ID")
@@ -150,28 +181,42 @@ func main() {
 			cpuLoad = val
 		}
 	}
+	antagonistCores := 6
+	if s := os.Getenv("ANTAGONIST_CORES"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 0 {
+			antagonistCores = v
+		}
+	}
 
 	if cpuLoad > 0 {
-		go runAntagonist(cpuLoad, serverID)
+		go runAntagonist(cpuLoad, antagonistCores, serverID)
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		rifAtArrival := atomic.AddInt32(&inflight, 1)
 		defer atomic.AddInt32(&inflight, -1)
+		atomic.AddUint64(&requestsTotal, 1)
 
 		start := time.Now()
+		ctx := r.Context()
 
 		work := int(rand.NormFloat64()*workMean + workMean)
 		if work < 0 {
 			work = 0
 		}
 		for i := 0; i < work; i++ {
+			if i%cancelCheckEvery == 0 && ctx.Err() != nil {
+				// The client/LB gave up on this query (deadline exceeded);
+				// stop burning CPU on it, and don't pollute the latency ring.
+				atomic.AddUint64(&cancelledTotal, 1)
+				return
+			}
 			hash := sha256.Sum256([]byte(fmt.Sprintf("%d-%d", time.Now().UnixNano(), i)))
 			_ = hex.EncodeToString(hash[:])
 		}
 
 		duration := time.Since(start)
-		recordLatency(duration.Milliseconds(), rifAtArrival)
+		recordLatency(duration.Microseconds(), rifAtArrival)
 
 		w.Header().Set("Content-Type", "text/html")
 		w.Header().Set("X-Served-By", serverID)
@@ -191,13 +236,32 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		currentRif := atomic.LoadInt32(&inflight)
 		w.Header().Set("X-Requests-In-Flight", strconv.FormatInt(int64(currentRif), 10))
-		w.Header().Set("X-Latency-Estimate-Ms", strconv.FormatInt(medianLatencyMs(currentRif), 10))
-		w.Header().Set("X-Probe-Response-Time", strconv.FormatInt(time.Now().UnixNano(), 10))
+		w.Header().Set("X-Latency-Estimate-Us", strconv.FormatInt(medianLatencyUs(currentRif), 10))
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `{"status":"healthy","server_id":"%s"}`, serverID)
 	})
 
-	log.Printf("Server %s starting on port %s (CPU load: %d%%)", serverID, port, cpuLoad)
+	// Prometheus scrape target. backend_cpu_seconds_total is the serving
+	// process only: the antagonist runs as a child process and is excluded
+	// by RUSAGE_SELF, so this is the paper's "job CPU" that Figure 6(c)
+	// plots as a percentage of the allocation.
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		var ru syscall.Rusage
+		_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
+		cpu := tvSeconds(ru.Utime) + tvSeconds(ru.Stime)
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		fmt.Fprintf(w, "# TYPE backend_cpu_seconds_total counter\n")
+		fmt.Fprintf(w, "backend_cpu_seconds_total %.6f\n", cpu)
+		fmt.Fprintf(w, "# TYPE backend_inflight gauge\n")
+		fmt.Fprintf(w, "backend_inflight %d\n", atomic.LoadInt32(&inflight))
+		fmt.Fprintf(w, "# TYPE backend_requests_total counter\n")
+		fmt.Fprintf(w, "backend_requests_total %d\n", atomic.LoadUint64(&requestsTotal))
+		fmt.Fprintf(w, "# TYPE backend_cancelled_total counter\n")
+		fmt.Fprintf(w, "backend_cancelled_total %d\n", atomic.LoadUint64(&cancelledTotal))
+	})
+
+	log.Printf("Server %s starting on port %s (CPU load: %d%%, antagonist cores: %d)",
+		serverID, port, cpuLoad, antagonistCores)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal(err)
 	}

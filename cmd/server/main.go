@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -38,11 +39,18 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
 	algo := *algorithm
-	envAlgo := os.Getenv("LB_ALGORITHM")
-	algo = envAlgo
+	if envAlgo := os.Getenv("LB_ALGORITHM"); envAlgo != "" {
+		algo = envAlgo
+	}
 
 	config := loadbalancer.DefaultConfig()
-	config.Algorithm = loadbalancer.Algorithm(algo)
+	switch loadbalancer.Algorithm(algo) {
+	case loadbalancer.AlgorithmPrequal, loadbalancer.AlgorithmRoundRobin:
+		config.Algorithm = loadbalancer.Algorithm(algo)
+	default:
+		logger.Log(ctx, LevelFatal, "invalid algorithm '"+algo+"'; use 'prequal' or 'roundrobin'")
+		os.Exit(1)
+	}
 	// Env-var overrides for observation gates. Any of "1", "true", "yes"
 	// (case-insensitive) enables; any other non-empty value disables.
 	if v, ok := os.LookupEnv("LB_METRICS"); ok {
@@ -50,6 +58,20 @@ func main() {
 	}
 	if v, ok := os.LookupEnv("LB_PICK_LOG"); ok {
 		config.EnablePickLog = parseBool(v)
+	}
+	// Probes issued per query (fractional allowed). Paper baseline is 3;
+	// lower it if the Prequal LB node itself saturates at high load levels.
+	if v, ok := os.LookupEnv("LB_RPROBE"); ok {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && f > 0 {
+			config.RProbe = f
+		}
+	}
+	// Query deadline enforced on the forward path, in milliseconds.
+	// 0 disables. Applies to both algorithms (the paper's 5s deadline).
+	if v, ok := os.LookupEnv("LB_FORWARD_TIMEOUT_MS"); ok {
+		if ms, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && ms >= 0 {
+			config.ForwardTimeout = time.Duration(ms) * time.Millisecond
+		}
 	}
 	// Probe mode: "per_query" (default) or "ticker".
 	if v, ok := os.LookupEnv("LB_PROBE_MODE"); ok {
@@ -76,6 +98,8 @@ func main() {
 		slog.String("algorithm", string(config.Algorithm)),
 		slog.String("probe_mode", string(config.ProbeMode)),
 		slog.Duration("probe_interval", config.ProbeInterval),
+		slog.Float64("r_probe", config.RProbe),
+		slog.Duration("forward_timeout", config.ForwardTimeout),
 		slog.Bool("enable_metrics", config.EnableMetrics),
 		slog.Bool("enable_pick_log", config.EnablePickLog))
 

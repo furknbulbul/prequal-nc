@@ -8,22 +8,24 @@ import (
 type Server struct {
 	ID      string
 	Address string
-	RIF     int32
-	Latency int64
+	RIF     int32 // accessed atomically
+	Latency int64 // microseconds; accessed atomically
 }
 
 type ProbeResult struct {
-	Timestamp time.Time
+	Timestamp time.Time // LB receipt time (paper fn. 9: never the server clock)
 	RIF       int32
-	Latency   int64
+	Latency   int64 // microseconds
 }
 
 type ProbePoolEntry struct {
-	Server        *Server
-	ReceivedAt    time.Time
+	Server     *Server
+	ReceivedAt time.Time
+	// RIF and RemainingUses are mutated after the entry is published to the
+	// pool (overuse compensation and reuse accounting); access atomically.
 	RIF           int32
-	Latency       int64
-	RemainingUses int //not used now
+	Latency       int64 // microseconds; immutable after publication
+	RemainingUses int32
 }
 
 type Algorithm string
@@ -53,6 +55,7 @@ type Config struct {
 	Delta           float64
 	MaxReusePool    int
 	RIFWindow       time.Duration
+	ForwardTimeout  time.Duration // query deadline on the forward path (paper: 5s); 0 disables
 	EnableMetrics   bool
 	EnablePickLog   bool
 	ProbeMode       ProbeMode     // ticker or per_query trigger
@@ -67,20 +70,24 @@ type Stats struct {
 	mutex              sync.RWMutex
 }
 
+// DefaultConfig mirrors the paper's baseline parameters (§5): pool size 16,
+// probes age out after 1s, r_probe=3, r_remove=1, Q_RIF=2^-0.25, delta=1,
+// and a 5s query deadline.
 func DefaultConfig() Config {
 	return Config{
 		ProbeTimeout:    1 * time.Second,
 		HealthCheckPath: "/health",
 		Algorithm:       AlgorithmPrequal,
 		QRIF:            0.84,
-		RProbe:          1.3,
+		RProbe:          3,
 		MinProbeRate:    10,
 		PoolCap:         16,
-		PoolTTL:         300 * time.Millisecond,
-		RRemove:         0.2,
+		PoolTTL:         1 * time.Second,
+		RRemove:         1,
 		Delta:           1,
 		RIFWindow:       time.Second,
 		MaxReusePool:    3,
+		ForwardTimeout:  5 * time.Second,
 		EnableMetrics:   false,
 		EnablePickLog:   false,
 		ProbeMode:       ProbeModePerQuery,

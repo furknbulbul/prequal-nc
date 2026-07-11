@@ -210,7 +210,7 @@ func (lb *LoadBalancer) handleProbeResult(srv *Server, result *ProbeResult) {
 	}
 	nServers := len(lb.servers)
 
-	srv.Latency = result.Latency
+	atomic.StoreInt64(&srv.Latency, result.Latency)
 	atomic.StoreInt32(&srv.RIF, result.RIF)
 
 	entry := &ProbePoolEntry{
@@ -218,7 +218,7 @@ func (lb *LoadBalancer) handleProbeResult(srv *Server, result *ProbeResult) {
 		ReceivedAt:    result.Timestamp,
 		RIF:           result.RIF,
 		Latency:       result.Latency,
-		RemainingUses: lb.computeBReuse(nServers),
+		RemainingUses: int32(lb.computeBReuse(nServers)),
 	}
 	lb.poolWriteMutex.Lock()
 	cur := lb.poolPtr.Load().entries
@@ -255,28 +255,31 @@ func appendPool(pool []*ProbePoolEntry, entry *ProbePoolEntry, cap int) []*Probe
 	return next
 }
 
-// not used
+// computeBReuse sizes each probe's reuse budget so the pool neither depletes
+// nor goes stale (Eq. 1 in the paper). The paper's (1 - m/n) factor assumes
+// pool size m < replica count n; with 10 replicas and a pool of 16 (duplicate
+// entries allowed) it goes negative, so we balance the raw per-query rates
+// instead: probes arrive at rProbe and leave at 1/bReuse (use) + rRemove.
 func (lb *LoadBalancer) computeBReuse(n int) int {
 	if n == 0 {
 		return 1
 	}
-	m := float64(lb.config.PoolCap)
-	denom := (1-m/float64(n))*lb.config.RProbe - lb.config.RRemove
-	bReuse := 1.0
-	if denom > 0 { // if pool cap > nOfServers, denom is < 0
-		if v := (1 + lb.config.Delta) / denom; v > 1 {
+	bReuse := float64(lb.config.MaxReusePool)
+	if denom := lb.config.RProbe - lb.config.RRemove; denom > 0 {
+		if v := (1 + lb.config.Delta) / denom; v < bReuse {
 			bReuse = v
 		}
+	}
+	if bReuse < 1 {
+		bReuse = 1
 	}
 	floor := int(bReuse)
 	if frac := bReuse - float64(floor); frac > 0 && rand.Float64() < frac {
 		floor++
 	}
-
-	if floor > lb.config.MaxReusePool {
-		floor = lb.config.MaxReusePool
+	if floor < 1 {
+		floor = 1
 	}
-
 	return floor
 }
 
@@ -335,21 +338,14 @@ func (lb *LoadBalancer) probeServer(server *Server) *ProbeResult {
 	}
 
 	var latency int64
-	if s := resp.Header.Get("X-Latency-Estimate-Ms"); s != "" {
+	if s := resp.Header.Get("X-Latency-Estimate-Us"); s != "" {
 		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
 			latency = v
 		}
 	}
 
-	timestamp := time.Now()
-	if s := resp.Header.Get("X-Probe-Response-Time"); s != "" {
-		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-			timestamp = time.Unix(0, v)
-		}
-	}
-
 	return &ProbeResult{
-		Timestamp: timestamp,
+		Timestamp: time.Now(),
 		RIF:       rif,
 		Latency:   latency,
 	}
@@ -375,7 +371,16 @@ func (lb *LoadBalancer) selectServerRR() *Server {
 }
 
 func (lb *LoadBalancer) selectServerPrequal() *Server {
-	theta, _ := lb.rifDist.Quantile(lb.config.QRIF, time.Now())
+	// Per-query probe removal (r_remove, alternating oldest/worst) keeps the
+	// pool from going stale or degrading toward loaded replicas (paper §4).
+	lb.applyRRemove()
+
+	theta, ok := lb.rifDist.Quantile(lb.config.QRIF, time.Now())
+	if !ok {
+		// No usable RIF distribution yet: treat every probe as hot so the
+		// rule degenerates to lowest-RIF (RIF-only control).
+		theta = -1
+	}
 
 	entries := lb.poolPtr.Load().entries
 	poolSize := len(entries)
@@ -383,17 +388,6 @@ func (lb *LoadBalancer) selectServerPrequal() *Server {
 	algorithm := string(lb.config.Algorithm)
 	metricsOn := lb.config.EnableMetrics
 	pickLogOn := lb.config.EnablePickLog
-	if len(entries) == 0 {
-		srv := lb.randomServer()
-		atomic.AddUint64(&lb.probeStats.PoolEmpty, 1)
-		if metricsOn {
-			lb.metrics.pickClass.WithLabelValues(algorithm, "no-pool").Inc()
-		}
-		if pickLogOn {
-			lb.recordPick(srv, "no-pool", 0, poolSize, 0)
-		}
-		return srv
-	}
 
 	var cutoff time.Time
 	ttlEnabled := lb.config.PoolTTL > 0
@@ -402,31 +396,36 @@ func (lb *LoadBalancer) selectServerPrequal() *Server {
 	}
 
 	var bestHot, bestCold *ProbePoolEntry
+	var bestHotRIF int32
+	var bestColdLatency int64
 	fresh := 0
 	for _, e := range entries {
 		if ttlEnabled && e.ReceivedAt.Before(cutoff) {
 			continue
 		}
 		fresh++
-		if e.RIF > theta {
-			if bestHot == nil || e.RIF < bestHot.RIF {
+		rif := atomic.LoadInt32(&e.RIF)
+		if rif > theta {
+			if bestHot == nil || rif < bestHotRIF {
 				bestHot = e
+				bestHotRIF = rif
 			}
 		} else {
-			if bestCold == nil || e.Latency < bestCold.Latency {
+			if bestCold == nil || e.Latency < bestColdLatency {
 				bestCold = e
+				bestColdLatency = e.Latency
 			}
 		}
 	}
 
-	if fresh == 0 {
+	if fresh < 2 {
 		srv := lb.randomServer()
 		atomic.AddUint64(&lb.probeStats.PoolEmpty, 1)
 		if metricsOn {
 			lb.metrics.pickClass.WithLabelValues(algorithm, "no-pool").Inc()
 		}
 		if pickLogOn {
-			lb.recordPick(srv, "no-pool", 0, poolSize, 0)
+			lb.recordPick(srv, "no-pool", theta, poolSize, fresh)
 		}
 		return srv
 	}
@@ -437,17 +436,8 @@ func (lb *LoadBalancer) selectServerPrequal() *Server {
 		winner = bestHot
 		class = "hot"
 	}
-	if winner == nil {
-		srv := lb.randomServer()
-		atomic.AddUint64(&lb.probeStats.NoWinner, 1)
-		if metricsOn {
-			lb.metrics.pickClass.WithLabelValues(algorithm, "no-winner").Inc()
-		}
-		if pickLogOn {
-			lb.recordPick(srv, "no-winner", theta, poolSize, fresh)
-		}
-		return srv
-	}
+
+	lb.consumeEntry(winner)
 
 	if metricsOn {
 		lb.metrics.pickClass.WithLabelValues(algorithm, class).Inc()
@@ -456,6 +446,29 @@ func (lb *LoadBalancer) selectServerPrequal() *Server {
 		lb.recordPick(winner.Server, class, theta, poolSize, fresh)
 	}
 	return winner.Server
+}
+
+func (lb *LoadBalancer) consumeEntry(used *ProbePoolEntry) {
+	for _, e := range lb.poolPtr.Load().entries {
+		if e.Server == used.Server {
+			atomic.AddInt32(&e.RIF, 1)
+		}
+	}
+	if atomic.AddInt32(&used.RemainingUses, -1) > 0 {
+		return
+	}
+	lb.poolWriteMutex.Lock()
+	defer lb.poolWriteMutex.Unlock()
+	cur := lb.poolPtr.Load().entries
+	next := make([]*ProbePoolEntry, 0, len(cur))
+	for _, e := range cur {
+		if e != used {
+			next = append(next, e)
+		}
+	}
+	if len(next) != len(cur) {
+		lb.poolPtr.Store(&poolSnapshot{entries: next})
+	}
 }
 
 func (lb *LoadBalancer) randomServer() *Server {
@@ -487,7 +500,6 @@ func (lb *LoadBalancer) recordPick(srv *Server, class string, threshold int32, p
 	lb.picksMutex.Unlock()
 }
 
-// not used
 func (lb *LoadBalancer) applyRRemove() {
 	if lb.config.RRemove <= 0 {
 		return
@@ -532,7 +544,7 @@ func removeWorst(pool []*ProbePoolEntry, qrif float64) []*ProbePoolEntry {
 	}
 	rifs := make([]int32, 0, len(pool))
 	for _, e := range pool {
-		rifs = append(rifs, e.RIF)
+		rifs = append(rifs, atomic.LoadInt32(&e.RIF))
 	}
 	sort.Slice(rifs, func(i, j int) bool { return rifs[i] < rifs[j] })
 	qIdx := int(float64(len(rifs)-1) * qrif)
@@ -549,10 +561,11 @@ func removeWorst(pool []*ProbePoolEntry, qrif float64) []*ProbePoolEntry {
 	worstHotIdx := -1
 	worstColdIdx := -1
 	for i, e := range pool {
-		if e.RIF > threshold {
-			if worstHotIdx == -1 || e.RIF > worstHotRIF {
+		rif := atomic.LoadInt32(&e.RIF)
+		if rif > threshold {
+			if worstHotIdx == -1 || rif > worstHotRIF {
 				worstHotIdx = i
-				worstHotRIF = e.RIF
+				worstHotRIF = rif
 			}
 		} else {
 			if worstColdIdx == -1 || e.Latency > worstColdLatency {
@@ -590,38 +603,53 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	lb.forwardRequest(server, w, r)
+	ok := lb.forwardRequest(server, w, r)
 	duration := time.Since(start)
 
 	if lb.config.EnableMetrics {
 		algorithm := string(lb.config.Algorithm)
 		lb.metrics.requestDuration.WithLabelValues(algorithm).Observe(duration.Seconds())
 	}
-	atomic.AddUint64(&lb.stats.SuccessfulRequests, 1)
+	if ok {
+		atomic.AddUint64(&lb.stats.SuccessfulRequests, 1)
+	}
 }
 
-func (lb *LoadBalancer) forwardRequest(server *Server, w http.ResponseWriter, r *http.Request) {
+func (lb *LoadBalancer) forwardRequest(server *Server, w http.ResponseWriter, r *http.Request) bool {
 	if lb.config.EnableMetrics {
 		algorithm := string(lb.config.Algorithm)
 		lb.metrics.activeRequests.WithLabelValues(algorithm).Inc()
 		defer lb.metrics.activeRequests.WithLabelValues(algorithm).Dec()
 	}
 
+	if lb.config.ForwardTimeout > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), lb.config.ForwardTimeout)
+		defer cancel()
+		r = r.WithContext(ctx)
+	}
+
+	ok := true
 	targetURL, _ := url.Parse("http://" + server.Address)
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 	proxy.Transport = forwardTransport
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		lb.logger.Error("Proxy error", slog.String("error", err.Error()))
+		ok = false
 		atomic.AddUint64(&lb.stats.FailedRequests, 1)
+		if r.Context().Err() == context.DeadlineExceeded {
+			http.Error(w, "Deadline exceeded", http.StatusGatewayTimeout)
+			return
+		}
+		lb.logger.Error("Proxy error", slog.String("error", err.Error()))
 		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 	}
 	proxy.ServeHTTP(w, r)
+	return ok
 }
 
 type PoolEntrySnapshot struct {
 	Server     string `json:"server"`
 	RIF        int32  `json:"rif"`
-	LatencyMs  int64  `json:"latency_ms"`
+	LatencyUs  int64  `json:"latency_us"`
 	AgeMs      int64  `json:"age_ms"`
 	ReusesLeft int    `json:"reuses_left"`
 }
@@ -662,10 +690,10 @@ func (lb *LoadBalancer) DebugSnapshot() DebugSnapshot {
 	for _, e := range entries {
 		pool = append(pool, PoolEntrySnapshot{
 			Server:     e.Server.ID,
-			RIF:        e.RIF,
-			LatencyMs:  e.Latency,
+			RIF:        atomic.LoadInt32(&e.RIF),
+			LatencyUs:  e.Latency,
 			AgeMs:      now.Sub(e.ReceivedAt).Milliseconds(),
-			ReusesLeft: e.RemainingUses,
+			ReusesLeft: int(atomic.LoadInt32(&e.RemainingUses)),
 		})
 	}
 	sort.Slice(pool, func(i, j int) bool { return pool[i].Server < pool[j].Server })

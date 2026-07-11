@@ -88,6 +88,15 @@ cmd_bootstrap() {
                 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
                     docker.io git rsync curl stress-ng
                 sudo systemctl enable --now docker
+                # Open-loop overload churns tens of thousands of short-lived
+                # connections: allow fast source-port reuse and widen the
+                # ephemeral range so port exhaustion doesn't fake errors.
+                printf 'net.ipv4.tcp_tw_reuse = 1\nnet.ipv4.ip_local_port_range = 1024 64999\nnet.core.somaxconn = 8192\n' \
+                    | sudo tee /etc/sysctl.d/99-prequal.conf >/dev/null
+                # Apply only our file: 'sysctl --system' re-runs Ubuntu's
+                # stock sysctl files too, some of which fail on this kernel
+                # with harmless-but-noisy "Invalid argument" warnings.
+                sudo sysctl -p /etc/sysctl.d/99-prequal.conf >/dev/null
             " 2>&1 | tag "$h"
             echo "[$h] bootstrap done"
         ) &
@@ -135,14 +144,15 @@ cmd_run_backends() {
         local idx=$((i + 1))
         local load=${SRV_CPU_LOADS[$i]:-0}
         local phase=${SRV_ANTAGONIST_PHASES[$i]:-0}
+        local ant_cores=${ANTAGONIST_CORES:-6}
         (
-            echo "[$h] run backend srv-$idx (CPU_LOAD=$load ANTAGONIST_PHASE=$phase)"
+            echo "[$h] run backend srv-$idx (CPU_LOAD=$load ANTAGONIST_PHASE=$phase ANTAGONIST_CORES=$ant_cores)"
             ssh_run "$h" "
                 sudo docker rm -f backend 2>/dev/null || true
                 sudo docker run -d --restart=unless-stopped --name backend \
-                    --network host \
+                    --network host --ulimit nofile=1048576:1048576 \
                     -e SERVER_ID=srv-$idx -e PORT=$BACKEND_PORT -e CPU_LOAD=$load \
-                    -e ANTAGONIST_PHASE=$phase \
+                    -e ANTAGONIST_PHASE=$phase -e ANTAGONIST_CORES=$ant_cores \
                     prequal-backend
             " 2>&1 | tag "$h"
         ) &
@@ -179,17 +189,23 @@ cmd_run_lbs() {
     local lb_pick_log="${LB_PICK_LOG:-0}"
     local lb_probe_mode="${LB_PROBE_MODE:-per_query}"
     local lb_probe_interval_ms="${LB_PROBE_INTERVAL_MS:-1000}"
+    # Paper baseline: 3 probes per query. Lower (e.g. 1.5) if the Prequal
+    # LB node itself saturates at the top ramp levels.
+    local lb_rprobe="${LB_RPROBE:-3}"
+    # Query deadline in ms, enforced by BOTH LBs (the paper's 5s deadline).
+    local lb_deadline_ms="${LB_FORWARD_TIMEOUT_MS:-5000}"
     local pids=()
     for h in "${PREQUAL_HOSTS[@]}"; do
         (
-            echo "[$h] run prequal LB (metrics=$lb_metrics picklog=$lb_pick_log probe=$lb_probe_mode/$lb_probe_interval_ms ms)"
+            echo "[$h] run prequal LB (metrics=$lb_metrics picklog=$lb_pick_log probe=$lb_probe_mode/$lb_probe_interval_ms ms rprobe=$lb_rprobe deadline=${lb_deadline_ms}ms)"
             ssh_run "$h" "
                 sudo docker rm -f lb 2>/dev/null || true
                 sudo docker run -d --restart=unless-stopped --name lb \
-                    --network host \
+                    --network host --ulimit nofile=1048576:1048576 \
                     -e LB_ALGORITHM=prequal -e BACKEND_SERVERS='$BACKENDS' \
                     -e LB_METRICS=$lb_metrics -e LB_PICK_LOG=$lb_pick_log \
                     -e LB_PROBE_MODE=$lb_probe_mode -e LB_PROBE_INTERVAL_MS=$lb_probe_interval_ms \
+                    -e LB_RPROBE=$lb_rprobe -e LB_FORWARD_TIMEOUT_MS=$lb_deadline_ms \
                     prequal-lb
             " 2>&1 | tag "$h"
         ) &
@@ -197,13 +213,14 @@ cmd_run_lbs() {
     done
     for h in "${RR_HOSTS[@]}"; do
         (
-            echo "[$h] run RR LB (metrics=$lb_metrics picklog=$lb_pick_log)"
+            echo "[$h] run RR LB (metrics=$lb_metrics picklog=$lb_pick_log deadline=${lb_deadline_ms}ms)"
             ssh_run "$h" "
                 sudo docker rm -f lb 2>/dev/null || true
                 sudo docker run -d --restart=unless-stopped --name lb \
-                    --network host \
+                    --network host --ulimit nofile=1048576:1048576 \
                     -e LB_ALGORITHM=roundrobin -e BACKEND_SERVERS='$BACKENDS' \
                     -e LB_METRICS=$lb_metrics -e LB_PICK_LOG=$lb_pick_log \
+                    -e LB_FORWARD_TIMEOUT_MS=$lb_deadline_ms \
                     prequal-lb
             " 2>&1 | tag "$h"
         ) &
@@ -213,12 +230,15 @@ cmd_run_lbs() {
 }
 
 cmd_install_clients() {
-    # Install upstream Go + hey on each client. Ubuntu's golang-go is too old.
+    # Install upstream Go + vegeta on each client. vegeta is an OPEN-LOOP
+    # generator (constant arrival rate regardless of completions), which the
+    # Figure 6 ramp requires; hey is closed-loop and self-throttles under
+    # overload. Ubuntu's golang-go is too old.
     local GO_VER=1.24.0
     local pids=()
     for h in "${CLIENT_HOSTS[@]}"; do
         (
-            echo "[$h] install Go ${GO_VER} + hey"
+            echo "[$h] install Go ${GO_VER} + vegeta"
             ssh_run "$h" "
                 set -e
                 case \"\$(uname -m)\" in
@@ -233,7 +253,7 @@ cmd_install_clients() {
                     rm -f go${GO_VER}.linux-\${GO_ARCH}.tar.gz
                 fi
                 export PATH=/usr/local/go/bin:\$HOME/bin:\$PATH
-                GOBIN=\$HOME/bin /usr/local/go/bin/go install github.com/rakyll/hey@latest
+                GOBIN=\$HOME/bin /usr/local/go/bin/go install github.com/tsenart/vegeta/v12@latest
                 grep -q '/usr/local/go/bin' ~/.bashrc || \
                     echo 'export PATH=/usr/local/go/bin:\$HOME/bin:\$PATH' >> ~/.bashrc
             " 2>&1 | tag "$h"
@@ -274,6 +294,14 @@ cmd_run_observer() {
         echo "      - targets:"
         for i in $(seq 1 "${#SRV_HOSTS[@]}"); do
             echo "          - srv-$i:$NODE_EXPORTER_PORT"
+        done
+        # Serving-process CPU (excludes the antagonist) for Figure 6(c).
+        echo "  - job_name: 'backend'"
+        echo "    metrics_path: /metrics"
+        echo "    static_configs:"
+        echo "      - targets:"
+        for i in $(seq 1 "${#SRV_HOSTS[@]}"); do
+            echo "          - srv-$i:$BACKEND_PORT"
         done
     } > "$cfg"
 
