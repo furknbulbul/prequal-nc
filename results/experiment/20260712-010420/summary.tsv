@@ -1,3 +1,0 @@
-algorithm	level_pct	target_qps	rps	p50_ms	p90_ms	p99_ms	error_pct
-prequal	174	3435	2499.04	2558.992	5000.233	5001.079	22.240
-roundrobin	174	3435	2968.54	24.980	5000.160	5000.706	12.351

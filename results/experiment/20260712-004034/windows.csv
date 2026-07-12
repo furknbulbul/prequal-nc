@@ -1,3 +1,0 @@
-algorithm,level_pct,target_qps,t_start_unix,t_end_unix
-roundrobin,174,3090,1783809635,1783809747
-prequal,174,3090,1783809770,1783809878
