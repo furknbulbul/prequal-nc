@@ -5,17 +5,18 @@ import (
 )
 
 type Metrics struct {
-	requestDuration  *prometheus.HistogramVec
-	activeRequests   *prometheus.GaugeVec
-	serverHealth     *prometheus.GaugeVec
-	serverRIF        *prometheus.GaugeVec
-	probesTriggered  *prometheus.CounterVec
-	probesSucceeded  *prometheus.CounterVec
-	probesFailed     *prometheus.CounterVec
-	probeDuration    *prometheus.HistogramVec
-	probeInflight    *prometheus.GaugeVec
-	poolSize         *prometheus.GaugeVec
-	pickClass        *prometheus.CounterVec
+	requestDuration    *prometheus.HistogramVec
+	activeRequests     *prometheus.GaugeVec
+	serverHealth       *prometheus.GaugeVec
+	serverRIF          *prometheus.GaugeVec
+	probesTriggered    *prometheus.CounterVec
+	probesSucceeded    *prometheus.CounterVec
+	probesFailed       *prometheus.CounterVec
+	probeDuration      *prometheus.HistogramVec
+	probeInflight      *prometheus.GaugeVec
+	probeRateEffective *prometheus.GaugeVec
+	poolSize           *prometheus.GaugeVec
+	pickClass          *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -85,6 +86,13 @@ func NewMetrics() *Metrics {
 			},
 			[]string{"algorithm"},
 		),
+		probeRateEffective: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "prequal_probe_rate_effective",
+				Help: "Adaptive probes-per-query currently in effect (de-rated from r_probe under load)",
+			},
+			[]string{"algorithm"},
+		),
 		poolSize: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "prequal_pool_size",
@@ -110,6 +118,7 @@ func NewMetrics() *Metrics {
 	prometheus.MustRegister(m.probesFailed)
 	prometheus.MustRegister(m.probeDuration)
 	prometheus.MustRegister(m.probeInflight)
+	prometheus.MustRegister(m.probeRateEffective)
 	prometheus.MustRegister(m.poolSize)
 	prometheus.MustRegister(m.pickClass)
 

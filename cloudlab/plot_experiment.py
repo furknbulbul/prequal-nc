@@ -1,29 +1,4 @@
 #!/usr/bin/env python3
-"""Render Figure 6 from a results/experiment/<ts>/ directory.
-
-Inputs:
-  results_dir          directory produced by experiment.sh, containing
-                       windows.csv, summary.tsv, prequal_*.json, rr_*.json.
-
-Outputs in the same directory:
-  experiment.png       three-panel plot: tail latency, error rate, CPU box.
-  cpu_samples.csv      raw per-srv CPU% samples used to draw panel (c).
-
-Latency and errors come from summary.tsv (parsed from vegeta JSON reports).
-Panel (c) plots the SERVING PROCESS's CPU as a percentage of its declared
-allocation (backend_cpu_seconds_total from the backend's /metrics, scraped
-by Prometheus). Like the paper, this excludes the antagonist and can exceed
-100% when a replica bursts above its allocation into idle machine capacity.
-
-Usage:
-  python3 plot_experiment.py RESULTS_DIR [--prom URL] [--alloc-cores N]
-  python3 plot_experiment.py RESULTS_DIR --ssh USER@OBSERVER [--alloc-cores N]
-
-Prefer --ssh: it tunnels to the observer's local Prometheus, avoiding the
-"Connection reset by peer" failures that hitting the public :9090 over the
-WAN produces (which otherwise leaves panel (c) / cpu_samples.csv empty).
-"""
-
 import argparse
 import contextlib
 import csv
@@ -61,13 +36,6 @@ def _free_local_port():
 
 @contextlib.contextmanager
 def resolve_prom(args):
-    """Yield a Prometheus base URL for the CPU queries.
-
-    With --ssh USER@HOST, open a local port-forward to the observer's
-    Prometheus and query it over that single persistent channel. This avoids
-    the "Connection reset by peer" failures seen when hitting the public
-    observer :9090 directly over the WAN. Without --ssh, use --prom as-is.
-    """
     if not args.ssh:
         yield args.prom
         return
@@ -190,7 +158,6 @@ def main():
 
     x = np.arange(len(levels))
 
-    # --- Panel (a): tail latency, log scale ---
     ax = axes[0]
     for stat, color in [("p50", "tab:blue"),
                         ("p90", "tab:orange"),
@@ -205,7 +172,6 @@ def main():
     ax.grid(True, which="both", linestyle=":", alpha=0.5)
     ax.legend(ncol=3, fontsize=8, loc="upper left")
 
-    # --- Panel (b): error rate ---
     ax = axes[1]
     rr_err = [rr[l]["err_pct"] for l in levels]
     pre_err = [pre[l]["err_pct"] for l in levels]
@@ -219,7 +185,6 @@ def main():
     ax.grid(True, axis="y", linestyle=":", alpha=0.5)
     ax.legend(fontsize=8, loc="upper left")
 
-    # --- Panel (c): CPU utilization distribution per srv per algo per level ---
     if have_cpu:
         cpu_path = out_dir / "cpu_samples.csv"
         cpu_path.write_text("algorithm,level_pct,instance,cpu_pct\n")
@@ -227,8 +192,6 @@ def main():
         cpu_by_algo_level.update({("roundrobin", l): [] for l in levels})
         with resolve_prom(args) as prom_url, cpu_path.open("a") as f:
             for w in windows:
-                # Levels run back-to-back; the 15s rate() window at the start
-                # of a level still reflects the previous one, so trim it.
                 t0 = w["t_start"]
                 if w["t_end"] - t0 > 30:
                     t0 += 15

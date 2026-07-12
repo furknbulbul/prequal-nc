@@ -1,113 +1,26 @@
-# Go Load Balancer
+# Prequal Load Balancer
 
-This project is an implementation of the load balancing algorithm described in the paper "Load is not what you should balance: Introducing Prequal" (NSDI '24). It demonstrates key concepts including Power of d choices, RIF (Requests in Flight) tracking, and HCL (Hot-Cold Lexicographic) scoring.
+Implementation of the load balancing algorithm from "Load is not what you should balance: Introducing Prequal" (NSDI '24), replicating the paper's Figure 6 experiment on CloudLab.
 
-## What's inside
+## Layout
 
-- Power of d choices with HCL (Hot-Cold Lexicographic) scoring
-- RIF tracking to see what servers are actually busy
-- Health checks that run in the background
-- Prometheus metrics and Grafana dashboards for visibility
+- `pkg/loadbalancer/` — Prequal and Round-Robin load balancer (probe pool, RIF distribution, HCL selection)
+- `cmd/server/` — load balancer binary
+- `backend/` — backend replica with CPU work loop and stress-ng antagonist
+- `cloudlab/` — CloudLab profile, deployment, experiment driver, and plotting
+- `results/` — experiment outputs
 
-## Prerequisites
+## Running on CloudLab
 
-- Go 1.23+
-- Docker
-- Docker Compose
-
-## Getting started
+Instantiate the topology with `cloudlab/profile.py`, fill in the node hostnames in `cloudlab/hosts.sh`, then:
 
 ```bash
-git clone https://github.com/omarshaarawi/loadbalancer.git
-cd loadbalancer
-./setup.sh
+./cloudlab/deploy.sh all          # bootstrap, sync, build, run, verify
+./cloudlab/experiment.sh          # run the load ramp
+python3 cloudlab/plot_experiment.py results/experiment/<ts> --ssh USER@OBSERVER
 ```
 
-Or manually:
-```bash
-docker-compose up --build
-```
-
-Then check out:
-- Load Balancer at http://localhost:8080
-- Prometheus at http://localhost:9090
-- Grafana at http://localhost:3001 (login: admin/admin)
-
-## How it works
-
-**Server selection (HCL - Hot-Cold Lexicographic):** Pick d servers at random, calculate RIF threshold at QRIF quantile (default 0.84). Classify servers as "hot" (high RIF) or "cold" (low RIF). If any cold servers exist, pick the one with lowest latency. If all are hot, pick the one with lowest RIF.
-
-**Health checks:** Background goroutine pings all servers on a timer. Dead servers get removed from rotation.
-
-**Metrics:** We export Prometheus metrics for request duration, active connections, server health, and RIF counts.
-
-## Testing it out
-
-Quick test:
-```bash
-curl http://localhost:8080
-```
-
-Check which servers are getting requests:
-```bash
-for i in {1..20}; do curl -I http://localhost:8080 2>&1 | grep -i "x-served-by"; done
-```
-
-Load test with hey:
-```bash
-go install github.com/rakyll/hey@latest
-hey -n 1000 -c 50 http://localhost:8080/
-```
-
-Or just loop curl if you want:
-```bash
-for i in {1..1000}; do curl -s http://localhost:8080 > /dev/null; done
-```
-
-Check RIF metrics while load is running:
-```bash
-curl http://localhost:8080/metrics | grep -E "active_requests|server_rif"
-```
-
-## Comparing Algorithms
-
-The repo runs both Prequal and Round-Robin simultaneously so you can compare them in real-time:
-
-- **Prequal**: http://localhost:8080
-- **Round-Robin**: http://localhost:8081
-- Both share the same backend servers
-
-### Multi-tenant simulation
-
-The backend servers simulate the multi-tenant scenario from the paper:
-
-- **server1**: 60% CPU consumed by antagonist load (contended)
-- **server2**: 60% CPU consumed by antagonist load (contended)
-- **server3**: No antagonist load (clean server)
-
-This replicates the paper's setup where some servers share machines with heavy background processes. Prequal should detect the slower response times on server1/server2 and route more traffic to server3, while Round-Robin distributes evenly.
-
-### Side-by-side load ramping test
-
-Run the comparison script to test both algorithms at the same time:
-
-```bash
-./compare.sh --duration 120
-```
-
-This replicates the Paper's Figure 6 methodology:
-- Ramps load from 75% to 174% of capacity in 9 steps
-- Tests both algorithms in parallel with identical load
-- Each step runs for 120 seconds (configurable)
-- Shows comparison of latency and throughput
-
-### Viewing results in Grafana
-
-The dashboard (http://localhost:3001) includes an algorithm filter dropdown:
-- Select "All" to overlay both algorithms
-- Compare latency percentiles (p50, p90, p99, p99.9) side-by-side
-- Watch how RIF distribution differs between algorithms
-- See which handles load spikes better
+See `./cloudlab/deploy.sh help` and `./cloudlab/experiment.sh -h` for options.
 
 ## References
 

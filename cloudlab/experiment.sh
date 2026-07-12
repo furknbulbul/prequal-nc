@@ -1,51 +1,4 @@
 #!/bin/bash
-# Figure 6 load-ramp driver (open loop).
-#
-# Drives 9 ramp levels (75% -> 174% of the fleet's aggregate CPU ALLOCATION)
-# against the Round-Robin LB, then the Prequal LB. Load is generated with
-# vegeta, an OPEN-LOOP generator: queries arrive at the target rate whether
-# or not earlier ones completed, so levels above 100% genuinely overload the
-# fleet (a closed-loop tool like hey self-throttles and can never do this).
-# Every request carries the paper's 5s deadline; requests that miss it are
-# the "deadline exceeded" errors of Figure 6(b).
-#
-# "100%" is calibrated from the allocation, not from max throughput: a short
-# low-rate run measures the median per-query service time, and
-#   baseline qps = n_servers * ALLOC_CORES / median_service_time.
-# ALLOC_CORES comes from hosts.sh (default 2). Backends are uncapped; the
-# gap between allocation and the 8-core machine is the spare capacity
-# Prequal exploits.
-#
-# Run from your laptop. Requires cloudlab/hosts.sh to be populated and
-# `./cloudlab/deploy.sh run` to have brought the cluster up (installs vegeta).
-#
-# Outputs land in results/experiment/<timestamp>/:
-#   windows.csv       algorithm,level_pct,target_qps,t_start_unix,t_end_unix
-#   prequal_<i>.json  vegeta JSON report per level (i=0..8)
-#   prequal_<i>.txt   human-readable vegeta report per level
-#   rr_<i>.json/.txt  same for round-robin
-#   summary.tsv       parsed metrics per (algo, level)
-#
-# Usage:
-#   ./cloudlab/experiment.sh [-d DURATION_SEC] [-g GAP_SEC] [-b BASELINE_QPS]
-#                            [-w MAX_WORKERS] [-T TIMEOUT_SEC] [-a ALGO]
-#                            [-m 0|1] [-p 0|1] [-P MODE] [-I MS] [-R RPROBE]
-#
-# Flags:
-#   -d  duration per level, default 60
-#   -g  pause between the RR and Prequal phases, default 15
-#   -b  baseline QPS for "100%". If omitted, calibrated from ALLOC_CORES
-#       and a 20s low-rate service-time measurement.
-#   -w  vegeta -max-workers cap, default 10000. This bounds client-side
-#       concurrency; if WRR is drowning at the top levels the cap may bind,
-#       making WRR results conservative (reality would be even worse).
-#   -T  per-request deadline in seconds, default 5 (the paper's deadline)
-#   -a  algorithm(s) to run: 'both' (default), 'prequal', or 'rr'
-#   -m  enable LB Prometheus metrics on the hot path (0/1). Restarts LBs.
-#   -p  enable LB /debug/pool recent-picks ring (0/1). Restarts LBs.
-#   -P  probe mode for Prequal: 'per_query' (paper) or 'ticker'. Restarts LBs.
-#   -I  probe tick interval in ms (ticker mode only). Restarts LBs.
-#   -R  probes per query (r_probe, fractional ok; paper: 3). Restarts LBs.
 
 set -euo pipefail
 
@@ -53,11 +6,36 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 HOSTS_FILE="$SCRIPT_DIR/hosts.sh"
 
+usage() {
+    cat << EOF
+Usage: ./cloudlab/experiment.sh [-d DURATION_SEC] [-g GAP_SEC] [-b BASELINE_QPS]
+                                [-w MAX_WORKERS] [-T TIMEOUT_SEC] [-a ALGO]
+                                [-m 0|1] [-p 0|1] [-P MODE] [-I MS] [-R RPROBE]
+                                [-A 0|1] [-N RPROBE_MIN] [-L LOAD_LOW] [-H LOAD_HIGH]
+
+Flags:
+  -d  duration per level, default 60
+  -g  pause between the RR and Prequal phases, default 15
+  -b  baseline QPS for "100%"; if omitted, calibrated from ALLOC_CORES
+  -w  vegeta -max-workers cap, default 10000
+  -T  per-request deadline in seconds, default 5
+  -a  algorithm(s) to run: 'both' (default), 'prequal', or 'rr'
+  -m  enable LB Prometheus metrics (0/1). Restarts LBs.
+  -p  enable LB /debug/pool recent-picks ring (0/1). Restarts LBs.
+  -P  probe mode: 'per_query' or 'ticker'. Restarts LBs.
+  -I  probe tick interval in ms (ticker mode only). Restarts LBs.
+  -R  probes per query (fractional ok). Restarts LBs.
+  -A  adaptive probing on/off (0/1). Restarts LBs.
+  -N  r_probe floor reached at/above -H load (default 1).
+  -L  in-flight forwards at/below which full -R is used (default 100).
+  -H  in-flight forwards at/above which -N is used (default 1000).
+EOF
+}
+
 if [ ! -f "$HOSTS_FILE" ]; then
     echo "Error: $HOSTS_FILE not found." >&2
     exit 1
 fi
-# shellcheck disable=SC1090
 source "$HOSTS_FILE"
 
 : "${LB_PORT:=8080}"
@@ -70,14 +48,18 @@ MAXWORKERS=10000
 TIMEOUT=5
 CAL_RATE=50
 CAL_DURATION=20
-ALGO="both"   # both | prequal | rr
-LB_METRICS_OPT=""   # empty = leave containers as-is; "0"/"1" = restart with that value
+ALGO="both"
+LB_METRICS_OPT=""
 LB_PICK_LOG_OPT=""
-LB_PROBE_MODE_OPT=""        # "" (unchanged) | per_query | ticker
-LB_PROBE_INTERVAL_MS_OPT="" # "" (unchanged) | integer ms
-LB_RPROBE_OPT=""            # "" (unchanged) | float probes-per-query
+LB_PROBE_MODE_OPT=""
+LB_PROBE_INTERVAL_MS_OPT=""
+LB_RPROBE_OPT=""
+LB_RPROBE_ADAPTIVE_OPT=""
+LB_RPROBE_MIN_OPT=""
+LB_PROBE_LOAD_LOW_OPT=""
+LB_PROBE_LOAD_HIGH_OPT=""
 
-while getopts "d:g:b:w:T:a:m:p:P:I:R:h" opt; do
+while getopts "d:g:b:w:T:a:m:p:P:I:R:A:N:L:H:h" opt; do
     case $opt in
         d) DURATION=$OPTARG ;;
         g) GAP=$OPTARG ;;
@@ -90,7 +72,11 @@ while getopts "d:g:b:w:T:a:m:p:P:I:R:h" opt; do
         P) LB_PROBE_MODE_OPT=$OPTARG ;;
         I) LB_PROBE_INTERVAL_MS_OPT=$OPTARG ;;
         R) LB_RPROBE_OPT=$OPTARG ;;
-        h) sed -n '2,55p' "$0"; exit 0 ;;
+        A) LB_RPROBE_ADAPTIVE_OPT=$OPTARG ;;
+        N) LB_RPROBE_MIN_OPT=$OPTARG ;;
+        L) LB_PROBE_LOAD_LOW_OPT=$OPTARG ;;
+        H) LB_PROBE_LOAD_HIGH_OPT=$OPTARG ;;
+        h) usage; exit 0 ;;
         *) echo "Unknown flag" >&2; exit 1 ;;
     esac
 done
@@ -119,8 +105,6 @@ N_SRV=${#SRV_HOSTS[@]}
 PREQUAL_LB="lb-prequal-1"
 RR_LB="lb-rr-1"
 CLIENT_PREQUAL=${CLIENT_HOSTS[0]}
-# Fall back to the same client if only one is provided; the two phases run
-# sequentially, so they never share the client's CPU.
 CLIENT_RR=${CLIENT_HOSTS[1]:-${CLIENT_HOSTS[0]}}
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new \
@@ -132,14 +116,7 @@ ssh_run() {
     ssh "${SSH_OPTS[@]}" "$CLOUDLAB_USER@$host" "$@"
 }
 
-# vegeta is installed by `deploy.sh run`. PATH is set in ~/.bashrc but ssh
-# non-login shells don't source it, so call it through the absolute path.
-# The attack writes its binary results to a per-run file on the client and
-# emits the JSON report on stdout; the .bin sticks around for the follow-up
-# text report. ulimit is raised because open-loop overload can legitimately
-# hold tens of thousands of sockets.
 vegeta_attack() {
-    # $1 client, $2 LB shortname, $3 rate (qps), $4 duration secs, $5 tag
     local client=$1 lb=$2 rate=$3 dur=$4 bin="/tmp/vegeta-$5.bin"
     ssh_run "$client" "ulimit -n 65536 2>/dev/null || true; \
 echo 'GET http://$lb:$LB_PORT/' | \$HOME/bin/vegeta attack \
@@ -149,15 +126,10 @@ echo 'GET http://$lb:$LB_PORT/' | \$HOME/bin/vegeta attack \
 }
 
 vegeta_text_report() {
-    # $1 client, $2 tag
     ssh_run "$1" "\$HOME/bin/vegeta report </tmp/vegeta-$2.bin"
 }
 
 parse_vegeta() {
-    # $1 = vegeta JSON report file.
-    # Emits: throughput \t p50_ms \t p90_ms \t p99_ms \t error_pct
-    # "success" is vegeta's fraction of 2xx responses; timeouts and non-2xx
-    # both count as errors, matching the paper's deadline-exceeded metric.
     python3 - "$1" <<'PY'
 import json, sys
 try:
@@ -174,10 +146,6 @@ PY
 }
 
 calibrate() {
-    # Measure the median per-query service time at a load low enough that
-    # nothing queues (even stressed servers have >=1 idle core for a lone
-    # query), then convert the declared allocation into a baseline rate:
-    #   baseline = n_srv * ALLOC_CORES / median_service_time
     echo "Calibration: ${CAL_DURATION}s @ ${CAL_RATE} qps against $RR_LB to measure service time..." >&2
     local json p50_ms
     json=$(vegeta_attack "$CLIENT_RR" "$RR_LB" "$CAL_RATE" "$CAL_DURATION" cal) || true
@@ -195,12 +163,12 @@ calibrate() {
         'BEGIN {printf "%.0f", n * a * 1000 / p}'
 }
 
-# If any observation gate or probe knob was given, restart the LB containers
-# with the new env vars so the sweep runs against them.
 if [ -n "$LB_METRICS_OPT" ] || [ -n "$LB_PICK_LOG_OPT" ] || \
    [ -n "$LB_PROBE_MODE_OPT" ] || [ -n "$LB_PROBE_INTERVAL_MS_OPT" ] || \
-   [ -n "$LB_RPROBE_OPT" ]; then
-    echo "Restarting LB containers with LB_METRICS=${LB_METRICS_OPT:-<unchanged>} LB_PICK_LOG=${LB_PICK_LOG_OPT:-<unchanged>} LB_PROBE_MODE=${LB_PROBE_MODE_OPT:-<unchanged>} LB_PROBE_INTERVAL_MS=${LB_PROBE_INTERVAL_MS_OPT:-<unchanged>} LB_RPROBE=${LB_RPROBE_OPT:-<unchanged>}..."
+   [ -n "$LB_RPROBE_OPT" ] || [ -n "$LB_RPROBE_ADAPTIVE_OPT" ] || \
+   [ -n "$LB_RPROBE_MIN_OPT" ] || [ -n "$LB_PROBE_LOAD_LOW_OPT" ] || \
+   [ -n "$LB_PROBE_LOAD_HIGH_OPT" ]; then
+    echo "Restarting LB containers with LB_METRICS=${LB_METRICS_OPT:-<unchanged>} LB_PICK_LOG=${LB_PICK_LOG_OPT:-<unchanged>} LB_PROBE_MODE=${LB_PROBE_MODE_OPT:-<unchanged>} LB_PROBE_INTERVAL_MS=${LB_PROBE_INTERVAL_MS_OPT:-<unchanged>} LB_RPROBE=${LB_RPROBE_OPT:-<unchanged>} LB_RPROBE_ADAPTIVE=${LB_RPROBE_ADAPTIVE_OPT:-<unchanged>} LB_RPROBE_MIN=${LB_RPROBE_MIN_OPT:-<unchanged>} LB_PROBE_LOAD_LOW=${LB_PROBE_LOAD_LOW_OPT:-<unchanged>} LB_PROBE_LOAD_HIGH=${LB_PROBE_LOAD_HIGH_OPT:-<unchanged>}..."
     if [ -n "$LB_METRICS_OPT" ]; then
         export LB_METRICS="$LB_METRICS_OPT"
     fi
@@ -215,6 +183,18 @@ if [ -n "$LB_METRICS_OPT" ] || [ -n "$LB_PICK_LOG_OPT" ] || \
     fi
     if [ -n "$LB_RPROBE_OPT" ]; then
         export LB_RPROBE="$LB_RPROBE_OPT"
+    fi
+    if [ -n "$LB_RPROBE_ADAPTIVE_OPT" ]; then
+        export LB_RPROBE_ADAPTIVE="$LB_RPROBE_ADAPTIVE_OPT"
+    fi
+    if [ -n "$LB_RPROBE_MIN_OPT" ]; then
+        export LB_RPROBE_MIN="$LB_RPROBE_MIN_OPT"
+    fi
+    if [ -n "$LB_PROBE_LOAD_LOW_OPT" ]; then
+        export LB_PROBE_LOAD_LOW="$LB_PROBE_LOAD_LOW_OPT"
+    fi
+    if [ -n "$LB_PROBE_LOAD_HIGH_OPT" ]; then
+        export LB_PROBE_LOAD_HIGH="$LB_PROBE_LOAD_HIGH_OPT"
     fi
     "$SCRIPT_DIR/deploy.sh" run-lbs
     echo "Sleeping 3s to let LBs settle..."
@@ -234,14 +214,7 @@ SUMMARY="$OUT/summary.tsv"
 
 echo "algorithm,level_pct,target_qps,t_start_unix,t_end_unix" > "$WINDOWS"
 printf "algorithm\tlevel_pct\ttarget_qps\trps\tp50_ms\tp90_ms\tp99_ms\terror_pct\n" > "$SUMMARY"
-# 93 103 114 127 141 157
-LEVELS_PCT=(30 103)
-
-# Phased ramp: run RR through all 9 levels back-to-back (no gap between
-# levels, like the paper's continuous ramp), then a single break, then
-# Prequal the same way. The antagonist schedule is deterministic, so both
-# phases see the same fleet conditions. Window timestamps are taken from
-# the client node's clock so they line up with Prometheus on the cluster.
+LEVELS_PCT=(30 75 83 93 103 114 127 141 157 174)
 
 run_ramp() {
     local algo=$1 client=$2 lb=$3 outprefix=$4
@@ -263,24 +236,20 @@ run_ramp() {
     done
 }
 
-# --- Phase 1: RR ramp (skipped if -a prequal) ---
 if [ "$ALGO" = "both" ] || [ "$ALGO" = "rr" ]; then
     run_ramp roundrobin "$CLIENT_RR" "$RR_LB" rr
 fi
 
-# --- Break between phases (only if both are being run) ---
 if [ "$ALGO" = "both" ]; then
     echo
     echo "============ Break: ${GAP}s ============"
     sleep "$GAP"
 fi
 
-# --- Phase 2: Prequal ramp (skipped if -a rr) ---
 if [ "$ALGO" = "both" ] || [ "$ALGO" = "prequal" ]; then
     run_ramp prequal "$CLIENT_PREQUAL" "$PREQUAL_LB" prequal
 fi
 
-# --- Parse everything into summary.tsv and print a comparison table ---
 echo
 echo "============ Results ============"
 for i in "${!LEVELS_PCT[@]}"; do

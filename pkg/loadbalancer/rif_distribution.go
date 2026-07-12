@@ -18,7 +18,6 @@ type rifSample struct {
 	t   time.Time
 }
 
-// quantileCache is atomically swapped on the Quantile fast path.
 type quantileCache struct {
 	q          float64
 	theta      int32

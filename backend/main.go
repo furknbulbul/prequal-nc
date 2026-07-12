@@ -24,11 +24,9 @@ var (
 )
 
 const (
-	latencyRingSize = 256
-	rifWindowDelta  = 2 // "latency at (or near) the current RIF"
-	workMean        = 4000.0
-	// How often the work loop polls for cancellation. Coarse enough to be
-	// free, fine enough that abandoned queries stop burning CPU quickly.
+	latencyRingSize  = 256
+	rifWindowDelta   = 2
+	workMean         = 4000.0
 	cancelCheckEvery = 256
 )
 
@@ -72,8 +70,6 @@ func medianLatencyUs(currentRif int32) int64 {
 	}
 	latencyRingMutex.Unlock()
 
-	// If there is no sample near the current RIF, fall back to the median
-	// over all recent samples (median for outlier robustness, per paper).
 	if len(near) == 0 {
 		if len(all) == 0 {
 			return 0
@@ -85,10 +81,6 @@ func medianLatencyUs(currentRif int32) int64 {
 	return near[len(near)/2]
 }
 
-// runAntagonist emulates a co-tenant competing for the machine's CPU.
-// cpuLoad is the duty cycle (0-100) of a 10s period; cores is how many CPUs
-// stress-ng pins while "on". cpuLoad=100 runs a constant antagonist, so the
-// replica's effective capacity is permanently machine_cores - cores.
 func runAntagonist(cpuLoad, cores int, serverID string) {
 	if cpuLoad <= 0 || cores <= 0 {
 		return
@@ -102,14 +94,14 @@ func runAntagonist(cpuLoad, cores int, serverID string) {
 			cmd := exec.Command("stress-ng",
 				"--cpu", strconv.Itoa(cores),
 				"--cpu-method", "matrixprod",
-				"--timeout", "0", // run forever
+				"--timeout", "0",
 			)
 			cmd.Stdout = os.Stderr
 			cmd.Stderr = os.Stderr
 			if err := cmd.Run(); err != nil {
 				log.Printf("antagonist stress-ng exited: %v", err)
 			}
-			time.Sleep(time.Second) // relaunch guard
+			time.Sleep(time.Second)
 		}
 	}
 
@@ -117,8 +109,6 @@ func runAntagonist(cpuLoad, cores int, serverID string) {
 	onSec := cyclePeriodSeconds * cpuLoad / 100
 	offSec := cyclePeriodSeconds - onSec
 
-	// Phase offset: explicit ANTAGONIST_PHASE env var wins; fall back to
-	// SERVER_ID-based stagger so unstaggered setups still work.
 	phaseOffsetSec := extractServerNum(serverID) % cyclePeriodSeconds
 	if v := os.Getenv("ANTAGONIST_PHASE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -150,8 +140,6 @@ func runAntagonist(cpuLoad, cores int, serverID string) {
 	}
 }
 
-// extractServerNum pulls the trailing integer from an ID like "server3"
-// so we can use it as a stagger offset. Returns 0 if no integer suffix.
 func extractServerNum(id string) int {
 	i := len(id)
 	for i > 0 && id[i-1] >= '0' && id[i-1] <= '9' {
@@ -206,8 +194,6 @@ func main() {
 		}
 		for i := 0; i < work; i++ {
 			if i%cancelCheckEvery == 0 && ctx.Err() != nil {
-				// The client/LB gave up on this query (deadline exceeded);
-				// stop burning CPU on it, and don't pollute the latency ring.
 				atomic.AddUint64(&cancelledTotal, 1)
 				return
 			}
@@ -241,10 +227,6 @@ func main() {
 		fmt.Fprintf(w, `{"status":"healthy","server_id":"%s"}`, serverID)
 	})
 
-	// Prometheus scrape target. backend_cpu_seconds_total is the serving
-	// process only: the antagonist runs as a child process and is excluded
-	// by RUSAGE_SELF, so this is the paper's "job CPU" that Figure 6(c)
-	// plots as a percentage of the allocation.
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		var ru syscall.Rusage
 		_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)

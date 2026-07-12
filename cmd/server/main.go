@@ -26,8 +26,6 @@ const (
 )
 
 func main() {
-	// Enable mutex + block profiling so /debug/pprof/mutex and /debug/pprof/block
-	// return meaningful data. Off by default in Go.
 	runtime.SetMutexProfileFraction(5)
 	runtime.SetBlockProfileRate(1_000_000)
 
@@ -51,29 +49,40 @@ func main() {
 		logger.Log(ctx, LevelFatal, "invalid algorithm '"+algo+"'; use 'prequal' or 'roundrobin'")
 		os.Exit(1)
 	}
-	// Env-var overrides for observation gates. Any of "1", "true", "yes"
-	// (case-insensitive) enables; any other non-empty value disables.
 	if v, ok := os.LookupEnv("LB_METRICS"); ok {
 		config.EnableMetrics = parseBool(v)
 	}
 	if v, ok := os.LookupEnv("LB_PICK_LOG"); ok {
 		config.EnablePickLog = parseBool(v)
 	}
-	// Probes issued per query (fractional allowed). Paper baseline is 3;
-	// lower it if the Prequal LB node itself saturates at high load levels.
 	if v, ok := os.LookupEnv("LB_RPROBE"); ok {
 		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && f > 0 {
 			config.RProbe = f
 		}
 	}
-	// Query deadline enforced on the forward path, in milliseconds.
-	// 0 disables. Applies to both algorithms (the paper's 5s deadline).
+	if v, ok := os.LookupEnv("LB_RPROBE_ADAPTIVE"); ok {
+		config.AdaptiveProbe = parseBool(v)
+	}
+	if v, ok := os.LookupEnv("LB_RPROBE_MIN"); ok {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && f > 0 {
+			config.RProbeMin = f
+		}
+	}
+	if v, ok := os.LookupEnv("LB_PROBE_LOAD_LOW"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			config.ProbeLoadLow = int32(n)
+		}
+	}
+	if v, ok := os.LookupEnv("LB_PROBE_LOAD_HIGH"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			config.ProbeLoadHigh = int32(n)
+		}
+	}
 	if v, ok := os.LookupEnv("LB_FORWARD_TIMEOUT_MS"); ok {
 		if ms, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && ms >= 0 {
 			config.ForwardTimeout = time.Duration(ms) * time.Millisecond
 		}
 	}
-	// Probe mode: "per_query" (default) or "ticker".
 	if v, ok := os.LookupEnv("LB_PROBE_MODE"); ok {
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case "ticker":
@@ -85,7 +94,6 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	// Probe interval (ticker mode only). Value is in milliseconds.
 	if v, ok := os.LookupEnv("LB_PROBE_INTERVAL_MS"); ok {
 		if ms, err := time.ParseDuration(v + "ms"); err == nil && ms > 0 {
 			config.ProbeInterval = ms
@@ -99,6 +107,10 @@ func main() {
 		slog.String("probe_mode", string(config.ProbeMode)),
 		slog.Duration("probe_interval", config.ProbeInterval),
 		slog.Float64("r_probe", config.RProbe),
+		slog.Bool("adaptive_probe", config.AdaptiveProbe),
+		slog.Float64("r_probe_min", config.RProbeMin),
+		slog.Int("probe_load_low", int(config.ProbeLoadLow)),
+		slog.Int("probe_load_high", int(config.ProbeLoadHigh)),
 		slog.Duration("forward_timeout", config.ForwardTimeout),
 		slog.Bool("enable_metrics", config.EnableMetrics),
 		slog.Bool("enable_pick_log", config.EnablePickLog))
@@ -135,7 +147,7 @@ func main() {
 	go func() {
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-		<-sigChan // blocks until SIGINT/SIGTERM
+		<-sigChan
 
 		logger.Info("Shutting down server...")
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)

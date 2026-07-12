@@ -1,20 +1,4 @@
-"""CloudLab profile for the Prequal Figure 6 distributed testbed.
-
-Topology (defaults match Figure 6 setup):
-  * lb-prequal-1     : Prequal load balancer
-  * lb-rr-1          : Round-Robin load balancer
-  * srv-1..8         : backend replicas
-  * client-1         : load generator pinned to lb-prequal-1
-  * client-2         : load generator pinned to lb-rr-1
-  * observer-1       : Prometheus + Grafana
-
-All nodes join a single LAN (`lan0`). CloudLab populates /etc/hosts on every
-node with these short names, so an LB dials backends as `srv-1:80`, a client
-dials `lb-prequal-1:8080`, etc.
-"""
-
 import geni.portal as portal
-import geni.rspec.pg as pg
 
 DEFAULT_IMAGE = "urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU22-64-STD"
 

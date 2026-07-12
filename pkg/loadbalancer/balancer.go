@@ -51,6 +51,7 @@ type LoadBalancer struct {
 	metrics         *Metrics
 	rrIndex         uint32
 	lastProbeNanos  int64
+	activeForwards  int32
 	stopCh          chan struct{}
 	probeStats      ProbeStats
 }
@@ -65,7 +66,7 @@ type ProbeStats struct {
 }
 
 const (
-	recentPicksCap = 100 // for debug
+	recentPicksCap = 100
 )
 
 type pickRecord struct {
@@ -135,7 +136,7 @@ func (lb *LoadBalancer) idleProbeLoop() {
 	defer t.Stop()
 	for {
 		select {
-		case <-lb.stopCh: // if lb.close() is called
+		case <-lb.stopCh:
 			return
 		case <-t.C:
 			last := atomic.LoadInt64(&lb.lastProbeNanos)
@@ -147,7 +148,7 @@ func (lb *LoadBalancer) idleProbeLoop() {
 }
 
 func (lb *LoadBalancer) onQueryArrival() {
-	r := lb.config.RProbe
+	r := lb.effectiveRProbe()
 	if r <= 0 {
 		return
 	}
@@ -159,6 +160,33 @@ func (lb *LoadBalancer) onQueryArrival() {
 		return
 	}
 	lb.triggerProbes(count)
+}
+
+func (lb *LoadBalancer) effectiveRProbe() float64 {
+	rMax := lb.config.RProbe
+	if !lb.config.AdaptiveProbe {
+		return rMax
+	}
+	rMin := lb.config.RProbeMin
+	if rMin > rMax {
+		rMin = rMax
+	}
+	lo, hi := lb.config.ProbeLoadLow, lb.config.ProbeLoadHigh
+	inflight := atomic.LoadInt32(&lb.activeForwards)
+	r := rMax
+	switch {
+	case hi <= lo || inflight <= lo:
+		r = rMax
+	case inflight >= hi:
+		r = rMin
+	default:
+		frac := float64(inflight-lo) / float64(hi-lo)
+		r = rMax - frac*(rMax-rMin)
+	}
+	if lb.config.EnableMetrics {
+		lb.metrics.probeRateEffective.WithLabelValues(string(lb.config.Algorithm)).Set(r)
+	}
+	return r
 }
 
 func (lb *LoadBalancer) triggerProbes(count int) {
@@ -183,7 +211,7 @@ func (lb *LoadBalancer) triggerProbes(count int) {
 		if metricsOn {
 			lb.metrics.probesTriggered.WithLabelValues(algorithm).Inc()
 		}
-		go func(srv *Server) { // spawns a goroutine
+		go func(srv *Server) {
 			if metricsOn {
 				lb.metrics.probeInflight.WithLabelValues(algorithm).Inc()
 			}
@@ -255,11 +283,6 @@ func appendPool(pool []*ProbePoolEntry, entry *ProbePoolEntry, cap int) []*Probe
 	return next
 }
 
-// computeBReuse sizes each probe's reuse budget so the pool neither depletes
-// nor goes stale (Eq. 1 in the paper). The paper's (1 - m/n) factor assumes
-// pool size m < replica count n; with 10 replicas and a pool of 16 (duplicate
-// entries allowed) it goes negative, so we balance the raw per-query rates
-// instead: probes arrive at rProbe and leave at 1/bReuse (use) + rRemove.
 func (lb *LoadBalancer) computeBReuse(n int) int {
 	if n == 0 {
 		return 1
@@ -371,14 +394,10 @@ func (lb *LoadBalancer) selectServerRR() *Server {
 }
 
 func (lb *LoadBalancer) selectServerPrequal() *Server {
-	// Per-query probe removal (r_remove, alternating oldest/worst) keeps the
-	// pool from going stale or degrading toward loaded replicas (paper §4).
 	lb.applyRRemove()
 
 	theta, ok := lb.rifDist.Quantile(lb.config.QRIF, time.Now())
 	if !ok {
-		// No usable RIF distribution yet: treat every probe as hot so the
-		// rule degenerates to lowest-RIF (RIF-only control).
 		theta = -1
 	}
 
@@ -589,6 +608,8 @@ func removeWorst(pool []*ProbePoolEntry, qrif float64) []*ProbePoolEntry {
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&lb.stats.TotalRequests, 1)
+	atomic.AddInt32(&lb.activeForwards, 1)
+	defer atomic.AddInt32(&lb.activeForwards, -1)
 
 	if lb.config.Algorithm == AlgorithmPrequal && lb.config.ProbeMode != ProbeModeTicker {
 		go lb.onQueryArrival()
@@ -698,7 +719,6 @@ func (lb *LoadBalancer) DebugSnapshot() DebugSnapshot {
 	}
 	sort.Slice(pool, func(i, j int) bool { return pool[i].Server < pool[j].Server })
 
-	// Walk the picks ring newest -> oldest under picksMu.
 	lb.picksMutex.Lock()
 	picks := make([]PickSnapshot, 0, lb.recentPicksLen)
 	for k := 0; k < lb.recentPicksLen; k++ {

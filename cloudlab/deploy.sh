@@ -1,18 +1,4 @@
 #!/bin/bash
-# CloudLab distributed deployment orchestrator for the Prequal Figure 6 testbed.
-#
-# Run from your laptop. Reads cloudlab/hosts.sh for SSH hostnames.
-#
-# Usage:
-#   cp cloudlab/hosts.sh.example cloudlab/hosts.sh   # then edit
-#   ./cloudlab/deploy.sh bootstrap     # install docker on every node
-#   ./cloudlab/deploy.sh sync          # rsync this repo to every node
-#   ./cloudlab/deploy.sh build         # build LB + backend docker images
-#   ./cloudlab/deploy.sh run           # start backends, LBs, observer, clients
-#   ./cloudlab/deploy.sh run-lbs       # restart just the LB containers
-#   ./cloudlab/deploy.sh verify        # health-check every component
-#   ./cloudlab/deploy.sh teardown      # stop + remove all containers
-#   ./cloudlab/deploy.sh all           # bootstrap; sync; build; run; verify
 
 set -e
 
@@ -20,12 +6,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 HOSTS_FILE="$SCRIPT_DIR/hosts.sh"
 
+usage() {
+    cat << EOF
+Usage: ./cloudlab/deploy.sh COMMAND
+
+Commands:
+  bootstrap     install docker on every node
+  sync          rsync this repo to every node
+  build         build LB + backend docker images
+  run           start backends, LBs, observer, clients
+  run-lbs       restart just the LB containers
+  verify        health-check every component
+  teardown      stop + remove all containers
+  all           bootstrap; sync; build; run; verify
+EOF
+}
+
 if [ ! -f "$HOSTS_FILE" ]; then
     echo "Error: $HOSTS_FILE not found."
     echo "Edit hosts.sh and fill in your CloudLab hostnames."
     exit 1
 fi
-# shellcheck disable=SC1090
 source "$HOSTS_FILE"
 
 : "${BACKEND_PORT:=80}"
@@ -73,10 +74,6 @@ pwait() {
     return "$status"
 }
 
-#
-# Subcommands
-#
-
 cmd_bootstrap() {
     local pids=()
     for h in $(all_hosts); do
@@ -88,14 +85,8 @@ cmd_bootstrap() {
                 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
                     docker.io git rsync curl stress-ng
                 sudo systemctl enable --now docker
-                # Open-loop overload churns tens of thousands of short-lived
-                # connections: allow fast source-port reuse and widen the
-                # ephemeral range so port exhaustion doesn't fake errors.
                 printf 'net.ipv4.tcp_tw_reuse = 1\nnet.ipv4.ip_local_port_range = 1024 64999\nnet.core.somaxconn = 8192\n' \
                     | sudo tee /etc/sysctl.d/99-prequal.conf >/dev/null
-                # Apply only our file: 'sysctl --system' re-runs Ubuntu's
-                # stock sysctl files too, some of which fail on this kernel
-                # with harmless-but-noisy "Invalid argument" warnings.
                 sudo sysctl -p /etc/sysctl.d/99-prequal.conf >/dev/null
             " 2>&1 | tag "$h"
             echo "[$h] bootstrap done"
@@ -162,7 +153,6 @@ cmd_run_backends() {
 }
 
 cmd_run_node_exporters() {
-    # node_exporter on every srv-* so the observer can scrape real CPU%
     local pids=()
     for h in "${SRV_HOSTS[@]}"; do
         (
@@ -183,21 +173,20 @@ cmd_run_node_exporters() {
 }
 
 cmd_run_lbs() {
-    # LB observability + probe-mode knobs. All optional; defaults preserve
-    # perf-mode behaviour (no metrics, no pick log, per-query probes).
     local lb_metrics="${LB_METRICS:-0}"
     local lb_pick_log="${LB_PICK_LOG:-0}"
     local lb_probe_mode="${LB_PROBE_MODE:-per_query}"
     local lb_probe_interval_ms="${LB_PROBE_INTERVAL_MS:-1000}"
-    # Paper baseline: 3 probes per query. Lower (e.g. 1.5) if the Prequal
-    # LB node itself saturates at the top ramp levels.
     local lb_rprobe="${LB_RPROBE:-3}"
-    # Query deadline in ms, enforced by BOTH LBs (the paper's 5s deadline).
+    local lb_rprobe_adaptive="${LB_RPROBE_ADAPTIVE:-0}"
+    local lb_rprobe_min="${LB_RPROBE_MIN:-1}"
+    local lb_probe_load_low="${LB_PROBE_LOAD_LOW:-100}"
+    local lb_probe_load_high="${LB_PROBE_LOAD_HIGH:-1000}"
     local lb_deadline_ms="${LB_FORWARD_TIMEOUT_MS:-5000}"
     local pids=()
     for h in "${PREQUAL_HOSTS[@]}"; do
         (
-            echo "[$h] run prequal LB (metrics=$lb_metrics picklog=$lb_pick_log probe=$lb_probe_mode/$lb_probe_interval_ms ms rprobe=$lb_rprobe deadline=${lb_deadline_ms}ms)"
+            echo "[$h] run prequal LB (metrics=$lb_metrics picklog=$lb_pick_log probe=$lb_probe_mode/$lb_probe_interval_ms ms rprobe=$lb_rprobe adaptive=$lb_rprobe_adaptive rprobe_min=$lb_rprobe_min load=$lb_probe_load_low..$lb_probe_load_high deadline=${lb_deadline_ms}ms)"
             ssh_run "$h" "
                 sudo docker rm -f lb 2>/dev/null || true
                 sudo docker run -d --restart=unless-stopped --name lb \
@@ -206,6 +195,8 @@ cmd_run_lbs() {
                     -e LB_METRICS=$lb_metrics -e LB_PICK_LOG=$lb_pick_log \
                     -e LB_PROBE_MODE=$lb_probe_mode -e LB_PROBE_INTERVAL_MS=$lb_probe_interval_ms \
                     -e LB_RPROBE=$lb_rprobe -e LB_FORWARD_TIMEOUT_MS=$lb_deadline_ms \
+                    -e LB_RPROBE_ADAPTIVE=$lb_rprobe_adaptive -e LB_RPROBE_MIN=$lb_rprobe_min \
+                    -e LB_PROBE_LOAD_LOW=$lb_probe_load_low -e LB_PROBE_LOAD_HIGH=$lb_probe_load_high \
                     prequal-lb
             " 2>&1 | tag "$h"
         ) &
@@ -230,10 +221,6 @@ cmd_run_lbs() {
 }
 
 cmd_install_clients() {
-    # Install upstream Go + vegeta on each client. vegeta is an OPEN-LOOP
-    # generator (constant arrival rate regardless of completions), which the
-    # Figure 6 ramp requires; hey is closed-loop and self-throttles under
-    # overload. Ubuntu's golang-go is too old.
     local GO_VER=1.24.0
     local pids=()
     for h in "${CLIENT_HOSTS[@]}"; do
@@ -295,7 +282,6 @@ cmd_run_observer() {
         for i in $(seq 1 "${#SRV_HOSTS[@]}"); do
             echo "          - srv-$i:$NODE_EXPORTER_PORT"
         done
-        # Serving-process CPU (excludes the antagonist) for Figure 6(c).
         echo "  - job_name: 'backend'"
         echo "    metrics_path: /metrics"
         echo "    static_configs:"
@@ -413,6 +399,6 @@ case "${1:-help}" in
         cmd_verify
         ;;
     help|--help|-h|*)
-        sed -n '2,18p' "$0"
+        usage
         ;;
 esac

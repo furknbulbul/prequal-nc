@@ -8,23 +8,21 @@ import (
 type Server struct {
 	ID      string
 	Address string
-	RIF     int32 // accessed atomically
-	Latency int64 // microseconds; accessed atomically
+	RIF     int32
+	Latency int64
 }
 
 type ProbeResult struct {
-	Timestamp time.Time // LB receipt time (paper fn. 9: never the server clock)
+	Timestamp time.Time
 	RIF       int32
-	Latency   int64 // microseconds
+	Latency   int64
 }
 
 type ProbePoolEntry struct {
-	Server     *Server
-	ReceivedAt time.Time
-	// RIF and RemainingUses are mutated after the entry is published to the
-	// pool (overuse compensation and reuse accounting); access atomically.
+	Server        *Server
+	ReceivedAt    time.Time
 	RIF           int32
-	Latency       int64 // microseconds; immutable after publication
+	Latency       int64
 	RemainingUses int32
 }
 
@@ -55,11 +53,15 @@ type Config struct {
 	Delta           float64
 	MaxReusePool    int
 	RIFWindow       time.Duration
-	ForwardTimeout  time.Duration // query deadline on the forward path (paper: 5s); 0 disables
+	ForwardTimeout  time.Duration
 	EnableMetrics   bool
 	EnablePickLog   bool
-	ProbeMode       ProbeMode     // ticker or per_query trigger
-	ProbeInterval   time.Duration // used only for ticker
+	ProbeMode       ProbeMode
+	ProbeInterval   time.Duration
+	AdaptiveProbe   bool
+	RProbeMin       float64
+	ProbeLoadLow    int32
+	ProbeLoadHigh   int32
 }
 
 type Stats struct {
@@ -70,9 +72,6 @@ type Stats struct {
 	mutex              sync.RWMutex
 }
 
-// DefaultConfig mirrors the paper's baseline parameters (§5): pool size 16,
-// probes age out after 1s, r_probe=3, r_remove=1, Q_RIF=2^-0.25, delta=1,
-// and a 5s query deadline.
 func DefaultConfig() Config {
 	return Config{
 		ProbeTimeout:    1 * time.Second,
@@ -92,5 +91,9 @@ func DefaultConfig() Config {
 		EnablePickLog:   false,
 		ProbeMode:       ProbeModePerQuery,
 		ProbeInterval:   1 * time.Second,
+		AdaptiveProbe:   false,
+		RProbeMin:       1,
+		ProbeLoadLow:    100,
+		ProbeLoadHigh:   1000,
 	}
 }
